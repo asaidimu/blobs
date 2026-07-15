@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/asaidimu/blobs/compare/v1.0.1...v1.0.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* add ability to update blob metadata ([c44e9b4](https://github.com/asaidimu/blobs/commit/c44e9b4dc926422870428d80a5b2ed738d005bde))
+
 ## [1.0.1](https://github.com/asaidimu/blobs/compare/v1.0.0...v1.0.1) (2026-07-15)
 
 
