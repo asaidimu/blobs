@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/asaidimu/blobs/compare/v1.0.0...v1.0.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* implement some more features ([d543cc1](https://github.com/asaidimu/blobs/commit/d543cc1f32486760ec7b4959b0caabfe25bc111b))
+
 # 1.0.0 (2026-07-15)
 
 
