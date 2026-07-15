@@ -567,6 +567,39 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// UpdateMetadata updates the ContentType and/or Custom metadata for an
+// existing blob without rewriting its content. Size, BlobID, and CreatedAt
+// are preserved from the stored ref; UpdatedAt is set to the current time.
+// Returns *errors.NotFoundError if key does not exist.
+func (h *NamespaceHandle) UpdateMetadata(ctx context.Context, key, contentType string, custom map[string]string) (*object.BlobInfo, error) {
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	if err := h.store.beginOp(); err != nil {
+		return nil, err
+	}
+	defer h.store.endOp()
+
+	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
+	if err != nil {
+		return nil, err
+	}
+
+	ref.Metadata.ContentType = contentType
+	ref.Metadata.Custom = custom
+	ref.Metadata.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.idx.PutRef(ctx, *ref); err != nil {
+		return nil, err
+	}
+
+	return &object.BlobInfo{
+		Key:         key,
+		NamespaceID: h.nsID,
+		Metadata:    ref.Metadata,
+	}, nil
+}
+
 // List returns BlobInfo for blobs in this namespace matching opts.
 // Results are in lexicographic key order.
 func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.BlobInfo, error) {
