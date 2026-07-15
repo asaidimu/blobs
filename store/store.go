@@ -29,6 +29,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gabriel-vasile/mimetype"
+
 	bserrors "github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/index"
 	"github.com/asaidimu/blobs/object"
@@ -110,6 +112,14 @@ func Open(cfg Config) (*Store, error) {
 	if cfg.Index == nil {
 		return nil, fmt.Errorf("store: Config.Index must be provided")
 	}
+	volOpts := volume.Options{
+		PageSize:       cfg.PageSize,
+		ChunkSize:      cfg.ChunkSize,
+		MaxSegmentSize: cfg.MaxSegmentSize,
+	}
+	if err := volOpts.Validate(); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
 
 	s := &Store{
 		cfg:     cfg,
@@ -148,6 +158,26 @@ func Open(cfg Config) (*Store, error) {
 }
 
 // Close flushes and closes all engines and the index backend.
+//
+// Close waits for every in-flight operation to finish before tearing
+// anything down: it does this by taking Store's write lock, and every
+// operation that touches the index or a volume engine holds the
+// corresponding read lock for its own full duration (see beginOp /
+// beginNSOp), not just for the moment it looks up an engine pointer. Since
+// a pending Lock() call blocks new RLock() callers and waits for existing
+// ones to release, this makes Close a true drain point: no operation that
+// was already running when Close was called can still be touching an
+// engine or the index by the time Close proceeds to shut them down, and no
+// new operation can start once Close has begun.
+//
+// One case Close cannot protect against: NamespaceHandle.Get returns an
+// io.ReadCloser whose actual disk reads happen after Get itself has
+// returned, so the read guard it acquired is held until the caller closes
+// that reader — not until Get returns. A caller that obtains a reader and
+// never closes it will cause Close to block indefinitely, exactly as
+// leaking any other closable handle (an unclosed *os.File, an unclosed
+// http.Response.Body) would jam an equivalent drain/shutdown sequence
+// elsewhere. Always close readers returned by Get.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,11 +228,19 @@ func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace) error 
 
 // GetNamespace returns the metadata for a namespace.
 func (s *Store) GetNamespace(ctx context.Context, nsID string) (*object.Namespace, error) {
+	if err := s.beginOp(); err != nil {
+		return nil, err
+	}
+	defer s.endOp()
 	return s.idx.GetNamespace(ctx, nsID)
 }
 
 // ListNamespaces returns all namespaces in the store.
 func (s *Store) ListNamespaces(ctx context.Context) ([]object.Namespace, error) {
+	if err := s.beginOp(); err != nil {
+		return nil, err
+	}
+	defer s.endOp()
 	return s.idx.ListNamespaces(ctx)
 }
 
@@ -250,6 +288,11 @@ func (s *Store) Namespace(nsID string) *NamespaceHandle {
 
 // Stats returns aggregate metrics across all namespaces.
 func (s *Store) Stats(ctx context.Context) (*object.StoreStats, error) {
+	if err := s.beginOp(); err != nil {
+		return nil, err
+	}
+	defer s.endOp()
+
 	namespaces, err := s.idx.ListNamespaces(ctx)
 	if err != nil {
 		return nil, err
@@ -300,14 +343,40 @@ func (s *Store) nsMutex(nsID string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-func (s *Store) engine(nsID string) (*volume.Engine, error) {
+// beginOp acquires a read guard on the store for an operation that
+// touches the index but not a specific volume engine. It returns
+// *errors.ClosedError if the store is already closed. On success, the
+// caller MUST call endOp exactly once when the operation is entirely
+// done — for an operation that hands back a long-lived handle (only
+// NamespaceHandle.Get does today), that means when the handle itself is
+// closed, not when the method that created it returns. See Close's doc
+// comment for why this is the store's drain mechanism.
+func (s *Store) beginOp() error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if s.closed {
-		return nil, &bserrors.ClosedError{}
+		s.mu.RUnlock()
+		return &bserrors.ClosedError{}
+	}
+	return nil
+}
+
+// endOp releases the guard acquired by beginOp or beginNSOp.
+func (s *Store) endOp() {
+	s.mu.RUnlock()
+}
+
+// beginNSOp is beginOp plus a namespace engine lookup, for operations that
+// touch a volume engine directly (Put, Get, Verify, RebuildIndex,
+// Compact). On success the read guard is held and the caller must call
+// endOp when done; on error no guard is held and endOp must not be
+// called.
+func (s *Store) beginNSOp(nsID string) (*volume.Engine, error) {
+	if err := s.beginOp(); err != nil {
+		return nil, err
 	}
 	eng, ok := s.engines[nsID]
 	if !ok {
+		s.endOp()
 		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
 	}
 	return eng, nil
@@ -334,13 +403,20 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	if opts.ContentType == "" {
-		opts.ContentType = "application/octet-stream"
-	}
 
-	eng, err := h.store.engine(h.nsID)
+	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return nil, err
+	}
+	defer h.store.endOp()
+
+	if opts.ContentType == "" {
+		head, err := peekForMIME(r)
+		if err != nil {
+			return nil, fmt.Errorf("store: detect mime type: %w", err)
+		}
+		opts.ContentType = mimetype.Detect(head.Bytes()).String()
+		r = io.MultiReader(head, r)
 	}
 
 	// VULN 8 fix: acquire the per-namespace quota mutex before reading stats
@@ -407,6 +483,25 @@ func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, e
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
+
+	eng, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
+		return nil, err
+	}
+	// Ownership of the store's read guard transfers to the returned
+	// chunkReader on success: Get itself returns quickly, but the actual
+	// chunk reads happen later, via chunkReader.Read, well after this call
+	// has returned. The guard must stay held for that whole lifetime so
+	// Store.Close cannot close this engine out from under an in-flight
+	// read — so it is released here only on the error paths below; on the
+	// success path, chunkReader.Close releases it exactly once instead.
+	guardTransferred := false
+	defer func() {
+		if !guardTransferred {
+			h.store.endOp()
+		}
+	}()
+
 	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
 	if err != nil {
 		return nil, err
@@ -415,11 +510,6 @@ func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, e
 	blob, err := h.store.idx.GetBlob(ctx, ref.BlobID)
 	if err != nil {
 		return nil, fmt.Errorf("store: get blob manifest: %w", err)
-	}
-
-	eng, err := h.store.engine(h.nsID)
-	if err != nil {
-		return nil, err
 	}
 
 	// Resolve chunk locations eagerly so the reader is self-contained.
@@ -432,7 +522,8 @@ func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, e
 		locations[i] = *loc
 	}
 
-	return newChunkReader(eng, locations), nil
+	guardTransferred = true
+	return newChunkReader(eng, locations, h.store.endOp), nil
 }
 
 // Head returns metadata for key without reading any blob data.
@@ -441,6 +532,11 @@ func (h *NamespaceHandle) Head(ctx context.Context, key string) (*object.BlobInf
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
+	if err := h.store.beginOp(); err != nil {
+		return nil, err
+	}
+	defer h.store.endOp()
+
 	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
 	if err != nil {
 		return nil, err
@@ -459,6 +555,11 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
+	if err := h.store.beginOp(); err != nil {
+		return err
+	}
+	defer h.store.endOp()
+
 	err := h.store.idx.CommitDelete(ctx, h.nsID, key)
 	if err != nil && index.IsNotFound(err) {
 		return nil // idempotent
@@ -469,6 +570,11 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 // List returns BlobInfo for blobs in this namespace matching opts.
 // Results are in lexicographic key order.
 func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.BlobInfo, error) {
+	if err := h.store.beginOp(); err != nil {
+		return nil, err
+	}
+	defer h.store.endOp()
+
 	refs, err := h.store.idx.ListRefs(ctx, h.nsID, opts.KeyPrefix)
 	if err != nil {
 		return nil, err
@@ -497,6 +603,10 @@ func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.
 
 // Stats returns live resource usage for this namespace.
 func (h *NamespaceHandle) Stats(ctx context.Context) (*object.NamespaceStats, error) {
+	if err := h.store.beginOp(); err != nil {
+		return nil, err
+	}
+	defer h.store.endOp()
 	return h.store.idx.GetStats(ctx, h.nsID)
 }
 
@@ -504,10 +614,11 @@ func (h *NamespaceHandle) Stats(ctx context.Context) (*object.NamespaceStats, er
 // Returns the first integrity error encountered, or nil.
 // This is an expensive operation — run it offline or on a schedule.
 func (h *NamespaceHandle) Verify(ctx context.Context) error {
-	eng, err := h.store.engine(h.nsID)
+	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return err
 	}
+	defer h.store.endOp()
 
 	refs, err := h.store.idx.ListRefs(ctx, h.nsID, "")
 	if err != nil {
@@ -543,10 +654,12 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 // files on disk. Should be called after Open when IsDirty() is true.
 // It does not reconstruct refs — those can only come from the WAL or a backup.
 func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
-	eng, err := h.store.engine(h.nsID)
+	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return err
 	}
+	defer h.store.endOp()
+
 	return eng.ScanSegments(func(entry object.ChunkEntry, _ volume.PageHeader) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -566,10 +679,11 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 // Physical segment rewriting (to reclaim actual disk space) is not yet
 // implemented — that is Phase 2 of compaction (segment merge/rewrite).
 func (h *NamespaceHandle) Compact(ctx context.Context) (CompactResult, error) {
-	eng, err := h.store.engine(h.nsID)
+	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return CompactResult{}, err
 	}
+	defer h.store.endOp()
 
 	// Collect all chunk entries that belong to blobs with RefCount == 0.
 	// We scan segment files (the ground truth) and cross-reference the index.
@@ -643,6 +757,17 @@ type CompactResult struct {
 	BytesFreed    int64
 }
 
+// peekForMIME reads up to 3072 bytes from r for MIME type detection
+// and returns them in a buffer, preserving r for subsequent reading.
+func peekForMIME(r io.Reader) (*bytes.Buffer, error) {
+	var head bytes.Buffer
+	_, err := io.CopyN(&head, r, 3072)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return &head, nil
+}
+
 // ── Quota check ───────────────────────────────────────────────────────────────
 
 // validateKey returns an error if key is not a valid blob key.
@@ -695,16 +820,24 @@ func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) er
 
 // chunkReader implements io.ReadCloser by reading chunks from the volume engine
 // in order, buffering one chunk at a time.
+//
+// It also carries ownership of the Store's read guard that NamespaceHandle.Get
+// acquired: release is called exactly once, when Close is called, so the
+// guard stays held for as long as the caller might still call Read — not
+// just for the duration of the Get call that created this reader. See
+// Store.Close's doc comment.
 type chunkReader struct {
 	engine    *volume.Engine
 	locations []object.ChunkEntry
 	idx       int    // next chunk to load
 	buf       []byte // current chunk payload
 	pos       int    // read position within buf
+	release   func()
+	closeOnce sync.Once
 }
 
-func newChunkReader(eng *volume.Engine, locations []object.ChunkEntry) *chunkReader {
-	return &chunkReader{engine: eng, locations: locations}
+func newChunkReader(eng *volume.Engine, locations []object.ChunkEntry, release func()) *chunkReader {
+	return &chunkReader{engine: eng, locations: locations, release: release}
 }
 
 func (r *chunkReader) Read(p []byte) (int, error) {
@@ -733,6 +866,9 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 func (r *chunkReader) Close() error {
 	r.buf = nil
 	r.idx = len(r.locations)
+	if r.release != nil {
+		r.closeOnce.Do(r.release)
+	}
 	return nil
 }
 

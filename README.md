@@ -20,6 +20,9 @@ for crash recovery.
 - **Crash recovery** — `RebuildIndex` reconstructs chunk locations by scanning segment files.
 - **Compaction** — marks dead chunks in-place (phase 1); segment rewriting reclaims disk (phase 2).
 - **Data verification** — CRC-32 per page + SHA-256 content hash; `Verify` endpoint checks integrity.
+- **MIME auto-detection** — when `ContentType` is empty, `Put` sniffs the first 3072 bytes via the `mimetype` library; no more manual `ContentType` boilerplate.
+- **Graceful shutdown** — `Close` drains in-flight operations before tearing down; `Get`'s reader holds a read guard until the caller closes it.
+- **Eager config validation** — negative sizes, page ≤ header, chunk > segment, and other nonsensical options are rejected at `Open` time, before any disk I/O.
 - **Security audited** — 10 findings (2 critical, 2 high, 4 medium, 2 info) all fixed and regression-tested.
 
 ---
@@ -53,15 +56,22 @@ s, err := store.Open(store.Config{
 })
 ```
 
+`Close` drains all in-flight operations before tearing down the index and
+volume engines. For `Get`, the returned reader holds a read guard on the
+store — always call `rc.Close()` to release it, or `Close` will block
+indefinitely.
+
 `Config` fields:
 
 | Field | Default | Description |
-|---|---|---|
+|---|---|---|---|
 | `DataDir` | required | Root for segment/WAL files. One subdirectory per namespace. |
 | `Index` | required | Pluggable `Backend` — see table above. |
-| `PageSize` | 16384 | Size of each page in segment files. |
-| `ChunkSize` | 4 MB | Target chunk size before splitting. |
+| `PageSize` | 16384 | Size of each page in segment files. Must be > 88 (header size) and ≤ uint32 max. |
+| `ChunkSize` | 4 MB | Target chunk size before splitting. Must not exceed `MaxSegmentSize`. |
 | `MaxSegmentSize` | 512 MB | Max size before rolling to a new segment file. |
+
+All options are validated eagerly at `Open` — a bad config fails before any disk I/O.
 
 A `"default"` namespace is created automatically on first open.
 
@@ -98,10 +108,19 @@ lowercase alphanumeric plus hyphens). `"default"` is reserved.
 
 ```go
 info, err := ns.Put(ctx, "photos/vacation.jpg", file, store.PutOptions{
-    ContentType: "image/jpeg",
-    Custom:      map[string]string{"album": "2026"},
+    Custom: map[string]string{"album": "2026"},
 })
 // info.Key, info.Metadata.BlobID, info.Metadata.Size, info.Metadata.ContentType ...
+```
+
+If `ContentType` is empty (default), `Put` auto-detects it by sniffing the first
+3072 bytes via the [`mimetype`](https://github.com/gabriel-vasile/mimetype)
+library. You can still override it explicitly:
+
+```go
+info, err := ns.Put(ctx, "script.sh", file, store.PutOptions{
+    ContentType: "text/x-shellscript",
+})
 ```
 
 `Put` streams the reader through SHA-256, splits into chunks, writes them to a
@@ -280,7 +299,7 @@ make test       # go clean -testcache && go test -v ./...
 go test -race ./...
 ```
 
-All 57 tests pass with no race conditions.
+All 119 tests pass with no race conditions.
 
 ---
 

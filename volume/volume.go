@@ -314,6 +314,68 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// Validate reports whether o is safe to use. A zero field is never
+// rejected — it means "use the package default", and the defaults are
+// always valid — but an explicitly-set nonsensical value is rejected
+// before it can reach the paging/segment code and cause a panic or silent
+// corruption at runtime. This is deliberately called both here (via Open)
+// and by store.Open, so a bad Config fails immediately, before any disk
+// I/O, regardless of whether the caller goes through package store or
+// uses package volume directly.
+func (o Options) Validate() error {
+	if o.PageSize < 0 {
+		return fmt.Errorf("volume: Options.PageSize must not be negative, got %d", o.PageSize)
+	}
+	if o.ChunkSize < 0 {
+		return fmt.Errorf("volume: Options.ChunkSize must not be negative, got %d", o.ChunkSize)
+	}
+	if o.MaxSegmentSize < 0 {
+		return fmt.Errorf("volume: Options.MaxSegmentSize must not be negative, got %d", o.MaxSegmentSize)
+	}
+
+	// A page must have room for at least one byte of payload beyond its
+	// own header, or every WriteBlob/ReadChunk call on it would panic or
+	// corrupt data (this is the exact PageSize=50 example from the
+	// production readiness report — 50 < pageHeaderSize=88).
+	if o.PageSize != 0 && o.PageSize <= pageHeaderSize {
+		return fmt.Errorf(
+			"volume: Options.PageSize (%d) must be greater than the page header size (%d); a page must have room for at least one byte of payload",
+			o.PageSize, pageHeaderSize,
+		)
+	}
+
+	// PageSize is encoded into the segment header as a uint32
+	// (encodePageHeader writes it via binary.LittleEndian.PutUint32). A
+	// PageSize beyond uint32 range would be silently truncated on encode
+	// — the same class of bug VULN 1/VULN 2 already fixed for ChunkID and
+	// BlobID, just in a different field.
+	if o.PageSize != 0 && uint64(o.PageSize) > math.MaxUint32 {
+		return fmt.Errorf(
+			"volume: Options.PageSize (%d) exceeds uint32 range and would be silently truncated when encoded into the segment header",
+			o.PageSize,
+		)
+	}
+
+	// Cross-field checks run against the resolved (defaults-applied)
+	// values: an interaction between an explicit setting and the default
+	// for the other field is just as nonsensical as a single bad field,
+	// e.g. MaxSegmentSize=1MB with ChunkSize left at its 4MB default.
+	resolved := o.withDefaults()
+	if resolved.ChunkSize > resolved.MaxSegmentSize {
+		return fmt.Errorf(
+			"volume: ChunkSize (%d) must not exceed MaxSegmentSize (%d): a single chunk must fit within one segment",
+			resolved.ChunkSize, resolved.MaxSegmentSize,
+		)
+	}
+	if int64(resolved.PageSize) > resolved.MaxSegmentSize {
+		return fmt.Errorf(
+			"volume: PageSize (%d) must not exceed MaxSegmentSize (%d): a segment must be able to hold at least one page",
+			resolved.PageSize, resolved.MaxSegmentSize,
+		)
+	}
+	return nil
+}
+
 // ── Buffer and hasher pools ───────────────────────────────────────────────────
 
 var chunkBufPool = sync.Pool{
@@ -394,6 +456,9 @@ type Engine struct {
 
 // Open opens (or creates) a volume engine rooted at rootDir for namespace nsID.
 func Open(rootDir, nsID string, opts Options) (*Engine, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
 	opts = opts.withDefaults()
 	dir := filepath.Join(rootDir, nsID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
