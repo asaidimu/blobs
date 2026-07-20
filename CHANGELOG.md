@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/asaidimu/blobs/compare/v1.0.2...v1.1.0) (2026-07-20)
+
+
+### Features
+
+* store, volume: two-phase compaction with segment rewrite, configurable default namespace, WAL replay support ([dc09b6c](https://github.com/asaidimu/blobs/commit/dc09b6cefcfad9a0510d2a1bf73648c3f79287cc))
+
 ## [1.0.2](https://github.com/asaidimu/blobs/compare/v1.0.1...v1.0.2) (2026-07-15)
 
 
