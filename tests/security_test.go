@@ -286,9 +286,10 @@ func TestSecurity_VULN4_PaddingBytesAreZero(t *testing.T) {
 	// (potentially another tenant's payload) would appear in the padding.
 	dir := t.TempDir()
 	s, err := store.Open(store.Config{
-		DataDir:  dir,
-		Index:    index.NewMemoryBackend(),
-		PageSize: 4096, // small page to make padding region large
+		DataDir:          dir,
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
+		PageSize:         4096, // small page to make padding region large
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -316,8 +317,9 @@ func TestSecurity_VULN4_PaddingBytesAreZero(t *testing.T) {
 	// if padding bytes corrupted adjacent data), and we trust the clear()
 	// call. A direct test would require access to the raw segment bytes.
 	s2, err := store.Open(store.Config{
-		DataDir: dir,
-		Index:   index.NewMemoryBackend(),
+		DataDir:          dir,
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
 	})
 	if err != nil {
 		t.Fatal(err)

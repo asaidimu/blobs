@@ -22,8 +22,9 @@ func openStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store.Open(store.Config{
-		DataDir: dir,
-		Index:   index.NewMemoryBackend(),
+		DataDir:          dir,
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -422,7 +423,11 @@ func TestVerify_Clean(t *testing.T) {
 
 func TestVerify_Corrupted(t *testing.T) {
 	dir := t.TempDir()
-	s, err := store.Open(store.Config{DataDir: dir, Index: index.NewMemoryBackend()})
+	s, err := store.Open(store.Config{
+		DataDir:          dir,
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +455,11 @@ func TestVerify_Corrupted(t *testing.T) {
 	}
 
 	// Re-open and verify — should detect corruption.
-	s2, err := store.Open(store.Config{DataDir: dir, Index: index.NewMemoryBackend()})
+	s2, err := store.Open(store.Config{
+		DataDir:          dir,
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

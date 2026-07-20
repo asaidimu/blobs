@@ -55,6 +55,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,6 +105,12 @@ const (
 	DefaultPageSize       = 16 * 1024
 	DefaultChunkSize      = 4 * 1024 * 1024
 	DefaultMaxSegmentSize = 512 * 1024 * 1024
+
+	// DefaultSegmentRewriteThreshold is the dead-byte ratio (by page count,
+	// 0.0–1.0) a sealed segment must reach before Compact's phase 2
+	// physically rewrites it to reclaim space. 0.30 means a segment is
+	// rewritten once 30% or more of its pages belong to deleted chunks.
+	DefaultSegmentRewriteThreshold = 0.30
 )
 
 // ── PageFlags ─────────────────────────────────────────────────────────────────
@@ -760,6 +769,443 @@ func (e *Engine) ScanSegments(fn func(object.ChunkEntry, PageHeader) error) erro
 	return nil
 }
 
+// SegmentStat summarises one segment's live/dead page and byte counts, as
+// observed from its on-disk page header flags at the time of the scan.
+type SegmentStat struct {
+	SegmentID  object.SegmentID
+	TotalPages int
+	DeadPages  int
+	TotalBytes int64
+	DeadBytes  int64
+}
+
+// DeadRatio returns the fraction (0.0–1.0) of this segment's pages that
+// belong to deleted chunks. Returns 0 for a segment with no pages at all.
+func (s SegmentStat) DeadRatio() float64 {
+	if s.TotalPages == 0 {
+		return 0
+	}
+	return float64(s.DeadPages) / float64(s.TotalPages)
+}
+
+// SegmentStats scans every segment file and returns per-segment live/dead
+// totals, ordered by SegmentID (equivalently, creation order). It is built
+// on top of ScanSegments — the same page-header deleted flag ReadChunk and
+// MarkDeleted already use — so it stays consistent with them by
+// construction rather than by convention.
+//
+// This exists to let a caller (package store's Compact) decide which
+// sealed segments are worth physically rewriting, without package volume
+// needing to know anything about the index or about why a chunk became
+// dead — it only reports what the on-disk flags already say.
+func (e *Engine) SegmentStats() ([]SegmentStat, error) {
+	byID := make(map[object.SegmentID]*SegmentStat)
+	err := e.ScanSegments(func(entry object.ChunkEntry, hdr PageHeader) error {
+		s, ok := byID[entry.SegmentID]
+		if !ok {
+			s = &SegmentStat{SegmentID: entry.SegmentID}
+			byID[entry.SegmentID] = s
+		}
+		s.TotalPages += entry.PageCount
+		s.TotalBytes += entry.Length
+		if hdr.Flags.IsDeleted() {
+			s.DeadPages += entry.PageCount
+			s.DeadBytes += entry.Length
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]SegmentStat, 0, len(byID))
+	for _, s := range byID {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SegmentID < out[j].SegmentID })
+	return out, nil
+}
+
+// ActiveSegmentID returns the currently-active (still being written to)
+// segment's ID. ok is false if no segment has been created yet. Callers
+// must never rewrite or delete the active segment — RewriteSegment and
+// DeleteSegmentFile both refuse to.
+func (e *Engine) ActiveSegmentID() (id object.SegmentID, ok bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.active == nil {
+		return 0, false
+	}
+	return object.SegmentID(e.active.seq), true
+}
+
+// SegmentRewriteResult summarises the outcome of rewriting one segment.
+type SegmentRewriteResult struct {
+	OldSegmentID object.SegmentID
+	NewSegmentID object.SegmentID
+	ChunksKept   int   // live chunks copied into the new segment
+	PagesFreed   int   // pages belonging to deleted chunks, not copied forward
+	BytesFreed   int64 // payload bytes belonging to deleted chunks, not copied forward
+}
+
+// RewriteSegment copies every live (not-deleted) chunk in the sealed
+// segment oldSegID, verbatim, into a freshly created segment, and returns
+// the new locations the caller must commit to the index. It does not
+// touch the index itself and does not delete oldSegID's files — package
+// store's Compact owns that ordering (index update, then delete) because
+// getting it backwards is what would make a crash mid-rewrite lose data
+// instead of merely leaving a segment un-reclaimed until the next run.
+//
+// "Verbatim" matters here: a live chunk's header, payload, and CRC32 are
+// copied as the exact bytes already on disk, not recomputed. The content
+// hasn't changed — only where it lives — so recomputing anything would be
+// pure risk (a transcription bug corrupting an otherwise-untouched chunk)
+// for zero benefit.
+//
+// Returns an error without creating anything if oldSegID is the currently
+// active segment — it is still being appended to and must never be
+// rewritten out from under a concurrent WriteBlob.
+func (e *Engine) RewriteSegment(oldSegID object.SegmentID) (*SegmentRewriteResult, []object.ChunkEntry, error) {
+	e.mu.Lock()
+	if e.active != nil && object.SegmentID(e.active.seq) == oldSegID {
+		e.mu.Unlock()
+		return nil, nil, fmt.Errorf("volume: cannot rewrite segment %s: it is the active segment", oldSegID)
+	}
+	newSeq := e.nextSeq
+	e.nextSeq++
+	e.mu.Unlock()
+
+	oldPath := e.segPath(uint64(oldSegID))
+	oldFile, err := os.Open(oldPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("volume: open segment %s for rewrite: %w", oldSegID, err)
+	}
+	defer oldFile.Close()
+
+	newSF, err := createSegFile(e.segPath(newSeq), newSeq, e.nsID, e.opts.PageSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("volume: create rewrite target for segment %s: %w", oldSegID, err)
+	}
+
+	pageSize := int64(e.opts.PageSize)
+	capacity := pageSize - int64(pageHeaderSize)
+	offset := int64(segHeaderSize)
+	hdrBuf := make([]byte, pageHeaderSize)
+
+	result := &SegmentRewriteResult{OldSegmentID: oldSegID, NewSegmentID: object.SegmentID(newSeq)}
+	var relocated []object.ChunkEntry
+
+	for {
+		n, readErr := oldFile.ReadAt(hdrBuf, offset)
+		if n < len(hdrBuf) {
+			break // no more complete page headers — end of written data
+		}
+		if readErr != nil && readErr != io.EOF {
+			newSF.close()
+			return nil, nil, fmt.Errorf("volume: read page header at offset %d during rewrite: %w", offset, readErr)
+		}
+
+		hdr, err := decodePageHeader(hdrBuf)
+		if err != nil {
+			newSF.close()
+			return nil, nil, fmt.Errorf("volume: decode page header at offset %d during rewrite: %w", offset, err)
+		}
+		flags, _ := decodeMagicFlags(hdr.MagicFlags)
+
+		pagesForChunk := (int64(hdr.DataLen) + capacity - 1) / capacity
+		if pagesForChunk < 1 {
+			pagesForChunk = 1
+		}
+		spanBytes := pagesForChunk * pageSize
+
+		if flags.IsDeleted() {
+			result.PagesFreed += int(pagesForChunk)
+			result.BytesFreed += int64(hdr.DataLen)
+			offset += spanBytes
+			continue
+		}
+
+		span := make([]byte, spanBytes)
+		if _, err := oldFile.ReadAt(span, offset); err != nil && err != io.EOF {
+			newSF.close()
+			return nil, nil, fmt.Errorf("volume: read chunk span at offset %d during rewrite: %w", offset, err)
+		}
+
+		newOffset, err := newSF.appendRaw(span)
+		if err != nil {
+			newSF.close()
+			return nil, nil, fmt.Errorf("volume: write rewritten chunk during rewrite: %w", err)
+		}
+
+		blobIDStr := blobIDFromDigest((*[sha256.Size]byte)(hdr.BlobID[:]))
+		relocated = append(relocated, object.ChunkEntry{
+			ChunkID:     chunkIDFromBlobID(blobIDStr, int(hdr.ChunkSeq)),
+			BlobID:      blobIDStr,
+			SegmentID:   object.SegmentID(newSeq),
+			NamespaceID: e.nsID,
+			PageOffset:  newOffset,
+			PageCount:   int(pagesForChunk),
+			Length:      int64(hdr.DataLen),
+			Seq:         int(hdr.ChunkSeq),
+		})
+		result.ChunksKept++
+		offset += spanBytes
+	}
+
+	if err := newSF.sync(); err != nil {
+		newSF.close()
+		return nil, nil, fmt.Errorf("volume: fsync rewritten segment for %s: %w", oldSegID, err)
+	}
+	if err := newSF.close(); err != nil {
+		return nil, nil, fmt.Errorf("volume: close rewritten segment for %s: %w", oldSegID, err)
+	}
+
+	return result, relocated, nil
+}
+
+// DeleteSegmentFile physically removes a sealed segment's data and WAL
+// files. The caller must not call this until every chunk that was live in
+// this segment has had its relocated location durably committed to the
+// index — see RewriteSegment's doc comment and Compact's phase 2 for why
+// that ordering is what keeps a mid-rewrite crash safe. Refuses to delete
+// the currently active segment.
+func (e *Engine) DeleteSegmentFile(segID object.SegmentID) error {
+	e.mu.RLock()
+	isActive := e.active != nil && object.SegmentID(e.active.seq) == segID
+	e.mu.RUnlock()
+	if isActive {
+		return fmt.Errorf("volume: refusing to delete segment %s: it is the active segment", segID)
+	}
+
+	path := e.segPath(uint64(segID))
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("volume: remove segment file %s: %w", path, err)
+	}
+	walPath := walPathFromSegPath(path)
+	if err := os.Remove(walPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("volume: remove WAL file %s: %w", walPath, err)
+	}
+	return nil
+}
+
+// ListSegmentIDs returns every segment file's ID by reading the directory
+// listing only — it does not open or read any segment's contents. This is
+// the cheap discovery step WAL replay is built on: finding out which
+// segments exist costs one directory read, versus ScanSegments/
+// SegmentStats' full page-by-page walk of every byte of every segment
+// file. Replay only needs the small per-segment WAL files after this.
+func (e *Engine) ListSegmentIDs() ([]object.SegmentID, error) {
+	e.mu.RLock()
+	entries, err := os.ReadDir(e.dir)
+	e.mu.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("volume: read dir %s: %w", e.dir, err)
+	}
+	var ids []object.SegmentID
+	for _, de := range entries {
+		if de.IsDir() || filepath.Ext(de.Name()) != ".vol" {
+			continue
+		}
+		var seq uint64
+		if _, err := fmt.Sscanf(de.Name(), "seg-%016x.vol", &seq); err != nil {
+			continue
+		}
+		ids = append(ids, object.SegmentID(seq))
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+// WALEntry is one durably-committed WriteBlob group, as recorded in a
+// segment's WAL file: one blob and every chunk WriteBlob wrote for it,
+// written and fsynced as a single unit (see appendWAL's call site in
+// WriteBlob — the segment itself is fsynced first, then the WAL entry
+// covering all of that blob's chunks is written and fsynced in one call).
+type WALEntry struct {
+	BlobID object.BlobID
+	Chunks []object.ChunkEntry // full ChunkEntry, seq order, ready to PutChunk directly
+}
+
+// ParseWAL reads every complete WAL entry recorded for segment segID, in
+// the order they were written, reconstructing a full ChunkEntry for each
+// chunk. PageCount is recomputed via the same ceil-division every other
+// page-count calculation in this package uses (the WAL doesn't store it);
+// Seq is parsed from each ChunkID's own "<blobID>#<seq>" suffix rather
+// than trusted from WAL position, so a caller doesn't have to assume WAL
+// ordering matches chunk ordering — it's cross-checked implicitly by
+// simply not depending on it.
+//
+// ParseWAL stops cleanly, without error, at the first incomplete or
+// malformed trailing entry, and at a missing WAL file entirely (returns
+// nil, nil). appendWAL writes an entry with a single Write call followed
+// by a Sync; a crash between those two, or mid-Write, can leave a torn
+// partial record as the very last bytes in the file. Every entry before
+// that point was written as a complete unit, so treating a torn tail as
+// "the log simply ends here" is correct — it is indistinguishable from,
+// and handled identically to, "this entry hadn't been synced yet when the
+// process stopped," which is exactly the case a WAL is supposed to leave
+// safely unreplayed.
+func (e *Engine) ParseWAL(segID object.SegmentID) ([]WALEntry, error) {
+	path := walPathFromSegPath(e.segPath(uint64(segID)))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("volume: read WAL %s: %w", path, err)
+	}
+
+	capacity := int64(e.opts.PageSize) - int64(pageHeaderSize)
+	if capacity <= 0 {
+		// Options.Validate() rejects a PageSize this small; this guard
+		// only prevents a division by zero/negative if ParseWAL is ever
+		// called against an Engine somehow opened without validation.
+		capacity = 1
+	}
+
+	var entries []WALEntry
+	off := 0
+	for off < len(data) {
+		entry, n, ok := decodeWALEntry(data[off:], e.nsID, capacity)
+		if !ok {
+			break // torn or malformed trailing entry — stop, do not error
+		}
+		entries = append(entries, entry)
+		off += n
+	}
+	return entries, nil
+}
+
+// decodeWALEntry decodes exactly one WAL entry from the start of buf,
+// mirroring appendWAL's write order field-for-field. Returns ok=false —
+// never an error — for anything short of a fully well-formed entry,
+// since ParseWAL's contract is to stop silently at the first bad entry
+// rather than fail the whole replay over a torn trailing write.
+func decodeWALEntry(buf []byte, nsID string, pageCapacity int64) (entry WALEntry, consumed int, ok bool) {
+	pos := 0
+
+	readU16 := func() (uint16, bool) {
+		if pos+2 > len(buf) {
+			return 0, false
+		}
+		v := binary.LittleEndian.Uint16(buf[pos:])
+		pos += 2
+		return v, true
+	}
+	readU32 := func() (uint32, bool) {
+		if pos+4 > len(buf) {
+			return 0, false
+		}
+		v := binary.LittleEndian.Uint32(buf[pos:])
+		pos += 4
+		return v, true
+	}
+	readU64 := func() (uint64, bool) {
+		if pos+8 > len(buf) {
+			return 0, false
+		}
+		v := binary.LittleEndian.Uint64(buf[pos:])
+		pos += 8
+		return v, true
+	}
+	readBytes := func(n int) ([]byte, bool) {
+		if n < 0 || pos+n > len(buf) {
+			return nil, false
+		}
+		b := buf[pos : pos+n]
+		pos += n
+		return b, true
+	}
+
+	magic, ok := readU32()
+	if !ok || magic != walMagicVal {
+		return WALEntry{}, 0, false
+	}
+	blobIDLen, ok := readU16()
+	if !ok {
+		return WALEntry{}, 0, false
+	}
+	blobIDBytes, ok := readBytes(int(blobIDLen))
+	if !ok {
+		return WALEntry{}, 0, false
+	}
+	blobID := object.BlobID(blobIDBytes)
+
+	chunkCount, ok := readU32()
+	if !ok {
+		return WALEntry{}, 0, false
+	}
+
+	chunks := make([]object.ChunkEntry, chunkCount)
+	for i := uint32(0); i < chunkCount; i++ {
+		cidLen, ok := readU16()
+		if !ok {
+			return WALEntry{}, 0, false
+		}
+		cidBytes, ok := readBytes(int(cidLen))
+		if !ok {
+			return WALEntry{}, 0, false
+		}
+		chunkID := object.ChunkID(cidBytes)
+
+		segIDRaw, ok := readU64()
+		if !ok {
+			return WALEntry{}, 0, false
+		}
+		pageOffset, ok := readU64()
+		if !ok {
+			return WALEntry{}, 0, false
+		}
+		length, ok := readU64()
+		if !ok {
+			return WALEntry{}, 0, false
+		}
+
+		seq, seqOK := chunkSeqFromChunkID(chunkID)
+		if !seqOK || seq < 0 || seq >= int(chunkCount) {
+			// A ChunkID that doesn't parse, or whose embedded sequence
+			// falls outside this entry's own chunk count, indicates a
+			// corrupt or foreign record — safer to discard the whole
+			// entry than to guess at a placement for it.
+			return WALEntry{}, 0, false
+		}
+
+		pages := (int64(length) + pageCapacity - 1) / pageCapacity
+		if pages < 1 {
+			pages = 1
+		}
+
+		chunks[seq] = object.ChunkEntry{
+			ChunkID:     chunkID,
+			BlobID:      blobID,
+			SegmentID:   object.SegmentID(segIDRaw),
+			NamespaceID: nsID,
+			PageOffset:  int64(pageOffset),
+			PageCount:   int(pages),
+			Length:      int64(length),
+			Seq:         seq,
+		}
+	}
+
+	return WALEntry{BlobID: blobID, Chunks: chunks}, pos, true
+}
+
+// chunkSeqFromChunkID parses the sequence number back out of a ChunkID's
+// "<blobID>#<seq>" format (see object.NewChunkID). Used instead of
+// trusting WAL entry position so a chunk's Seq is self-describing.
+func chunkSeqFromChunkID(id object.ChunkID) (int, bool) {
+	s := string(id)
+	i := strings.LastIndexByte(s, '#')
+	if i < 0 || i == len(s)-1 {
+		return 0, false
+	}
+	seq, err := strconv.Atoi(s[i+1:])
+	if err != nil || seq < 0 {
+		return 0, false
+	}
+	return seq, true
+}
+
 // Close flushes and closes the active segment, clears the dirty flag.
 func (e *Engine) Close() error {
 	e.mu.Lock()
@@ -1117,6 +1563,21 @@ func (sf *segFile) appendChunk(hdr pageHeader, payload []byte, pageSize int) (of
 
 // appendWAL writes a WAL entry using the kept-open wal file.
 // Uses a pooled buffer — zero per-call allocation.
+// appendRaw writes buf — already-formatted, page-aligned bytes (header +
+// payload + padding) exactly as they existed on disk — verbatim to the
+// segment, advancing offset by len(buf). Used only by RewriteSegment,
+// which relocates a live chunk's physical bytes unchanged into a new
+// segment: the content hasn't changed, only where it lives, so nothing
+// about the header, payload, or CRC needs to be (or should be) recomputed.
+func (sf *segFile) appendRaw(buf []byte) (offset int64, err error) {
+	offset = sf.offset
+	if _, err := sf.bw.Write(buf); err != nil {
+		return 0, fmt.Errorf("volume: append raw page span: %w", err)
+	}
+	sf.offset += int64(len(buf))
+	return offset, nil
+}
+
 func (sf *segFile) appendWAL(blobID object.BlobID, chunks []object.ChunkEntry) error {
 	p := getWALBuf()
 	buf := *p

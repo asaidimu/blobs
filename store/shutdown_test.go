@@ -16,8 +16,9 @@ import (
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(store.Config{
-		DataDir: t.TempDir(),
-		Index:   index.NewMemoryBackend(),
+		DataDir:          t.TempDir(),
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
@@ -61,6 +62,11 @@ func assertStillBlocked(t *testing.T, done <-chan struct{}, d time.Duration, msg
 // Put is still writing to it. An io.Pipe reader lets us hold WriteBlob's
 // read call open for as long as we choose, deterministically, without
 // sleeps standing in for synchronization.
+//
+// Since Put leaves ContentType empty here, this also exercises content-type
+// detection's own blocking read from pr — see
+// TestClose_WaitsDuringContentTypeDetection for a test that isolates that
+// specific phase on its own.
 func TestClose_WaitsForInFlightPut(t *testing.T) {
 	s := openTestStore(t)
 	ns := s.Namespace("default")
@@ -103,6 +109,65 @@ func TestClose_WaitsForInFlightPut(t *testing.T) {
 	}
 
 	waitOrFatal(t, closeDone, 2*time.Second, "Store.Close() never completed after the in-flight Put finished")
+	if closeErr != nil {
+		t.Fatalf("Close returned an error: %v", closeErr)
+	}
+}
+
+// TestClose_WaitsDuringContentTypeDetection isolates a specific ordering
+// bug that content-type auto-detection introduced and this test would
+// have caught immediately: detectContentType reads from the caller's
+// reader before WriteBlob does, and that read blocks on slow caller I/O
+// exactly like WriteBlob's own reads do. If that read ran BEFORE
+// beginNSOp acquired the store's guard, a Put stalled during the sniff
+// phase specifically — before a single byte has reached WriteBlob — would
+// not yet be "in flight" as far as Close is concerned, and Close could
+// complete right out from under it. The fix was reordering Put so
+// beginNSOp happens first; this test holds the pipe open with fewer bytes
+// than the sniff window, so the only thing that could possibly be
+// blocking is the sniff read itself, not WriteBlob's.
+func TestClose_WaitsDuringContentTypeDetection(t *testing.T) {
+	s := openTestStore(t)
+	ns := s.Namespace("default")
+
+	pr, pw := io.Pipe()
+	putDone := make(chan struct{})
+	var putErr error
+	go func() {
+		defer close(putDone)
+		// ContentType left empty: this Put must go through detection.
+		_, putErr = ns.Put(context.Background(), "sniff-key", pr, store.PutOptions{})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan struct{})
+	var closeErr error
+	go func() {
+		defer close(closeDone)
+		closeErr = s.Close()
+	}()
+
+	assertStillBlocked(t, closeDone, 150*time.Millisecond,
+		"Store.Close() returned while a Put was still blocked reading for content-type detection — detection must run inside the store's guard, not before it")
+
+	// A handful of bytes — nowhere near the sniff window's size — is
+	// enough to let ReadFull inside detectContentType return (via
+	// io.ErrUnexpectedEOF once the pipe is closed) and the rest of Put
+	// proceed.
+	if _, err := pw.Write([]byte("PK")); err != nil { // looks like the start of a zip, content specifics don't matter here
+		t.Fatalf("pw.Write: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("pw.Close: %v", err)
+	}
+
+	waitOrFatal(t, putDone, 2*time.Second, "Put never finished after the pipe was closed")
+	if putErr != nil {
+		t.Fatalf("Put returned an error: %v", putErr)
+	}
+
+	waitOrFatal(t, closeDone, 2*time.Second, "Store.Close() never completed after the stalled Put finished")
 	if closeErr != nil {
 		t.Fatalf("Close returned an error: %v", closeErr)
 	}
@@ -247,9 +312,10 @@ func TestOperationsRejectedAfterClose(t *testing.T) {
 // write time.
 func TestConfigValidation_RejectsNonsensicalPageSize(t *testing.T) {
 	_, err := store.Open(store.Config{
-		DataDir:  t.TempDir(),
-		Index:    index.NewMemoryBackend(),
-		PageSize: 50, // < pageHeaderSize (88)
+		DataDir:          t.TempDir(),
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
+		PageSize:         50, // < pageHeaderSize (88)
 	})
 	if err == nil {
 		t.Fatal("store.Open with PageSize=50 = nil error, want a validation error")
@@ -258,8 +324,9 @@ func TestConfigValidation_RejectsNonsensicalPageSize(t *testing.T) {
 
 func TestConfigValidation_AcceptsZeroValues(t *testing.T) {
 	s, err := store.Open(store.Config{
-		DataDir: t.TempDir(),
-		Index:   index.NewMemoryBackend(),
+		DataDir:          t.TempDir(),
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
 		// PageSize, ChunkSize, MaxSegmentSize all left at zero.
 	})
 	if err != nil {
@@ -270,10 +337,11 @@ func TestConfigValidation_AcceptsZeroValues(t *testing.T) {
 
 func TestConfigValidation_RejectsInconsistentChunkAndSegmentSize(t *testing.T) {
 	_, err := store.Open(store.Config{
-		DataDir:        t.TempDir(),
-		Index:          index.NewMemoryBackend(),
-		ChunkSize:      10 * 1024 * 1024,
-		MaxSegmentSize: 1024 * 1024, // smaller than ChunkSize
+		DataDir:          t.TempDir(),
+		Index:            index.NewMemoryBackend(),
+		DefaultNamespace: "default",
+		ChunkSize:        10 * 1024 * 1024,
+		MaxSegmentSize:   1024 * 1024, // smaller than ChunkSize
 	})
 	if err == nil {
 		t.Fatal("store.Open with ChunkSize > MaxSegmentSize = nil error, want a validation error")

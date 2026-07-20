@@ -17,13 +17,15 @@ for crash recovery.
 - **Pluggable index** — `MemoryBackend` for tests, `BboltBackend` for production (ACID, single-file, crash-safe).
 - **Segment-based storage** — fixed-size pages (default 16 KB), cache-aligned headers, zero-allocation read path.
 - **Write-Ahead Log (WAL)** — fsync'd before return; survive process crash after `Put` succeeds.
-- **Crash recovery** — `RebuildIndex` reconstructs chunk locations by scanning segment files.
-- **Compaction** — marks dead chunks in-place (phase 1); segment rewriting reclaims disk (phase 2).
+- **Crash recovery** — dirty-flag detection with automatic WAL replay on `Open`; `RebuildIndex` reconstructs chunk locations by scanning segment files.
+- **Compaction** — two-phase: marks dead chunks in-place (phase 1); rewrites sealed segments above a configurable dead-byte threshold to reclaim disk space (phase 2).
 - **Data verification** — CRC-32 per page + SHA-256 content hash; `Verify` endpoint checks integrity.
 - **MIME auto-detection** — when `ContentType` is empty, `Put` sniffs the first 3072 bytes via the `mimetype` library; no more manual `ContentType` boilerplate.
 - **Graceful shutdown** — `Close` drains in-flight operations before tearing down; `Get`'s reader holds a read guard until the caller closes it.
 - **Eager config validation** — negative sizes, page ≤ header, chunk > segment, and other nonsensical options are rejected at `Open` time, before any disk I/O.
-- **Security audited** — 10 findings (2 critical, 2 high, 4 medium, 2 info) all fixed and regression-tested.
+- **HTTP server** — embedded REST API with range requests, CORS, and JSON error responses; curl-friendly.
+- **TypeScript client** — first-party browser/Node.js SDK with streaming reads, cursor pagination, reactive `PagedBlobs`, and file uploads.
+- **Security audited** — 10 findings (2 critical, 2 high, 4 medium, 2 info) all fixed with dedicated regression tests in `tests/security_test.go`.
 
 ---
 
@@ -174,6 +176,65 @@ Returns `[]object.BlobInfo` in lexicographic order.
 
 ---
 
+## HTTP Server
+
+The `server` package provides an embedded REST API. Start it with:
+
+```bash
+go run github.com/asaidimu/blobs/server -addr :8080 -data-dir ./data/blobs -index-path ./data/index.bbolt
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/namespaces/{ns}/blobs/{key}` | Upload blob (raw body). Auto-creates namespace. |
+| `GET` | `/namespaces/{ns}/blobs/{key}` | Download blob. Supports `Range` header for partial reads. |
+| `HEAD` | `/namespaces/{ns}/blobs/{key}` | Metadata only (`X-Checksum`, `X-Created-At`, `X-Updated-At`). |
+| `DELETE` | `/namespaces/{ns}/blobs/{key}` | Remove ref (idempotent, returns 204). |
+| `GET` | `/namespaces/{ns}/blobs` | List blobs (`?prefix=`, `?after=`, `?limit=`). |
+| `PUT` | `/namespaces/{ns}` | Create namespace (optional JSON body with quota). |
+| `GET` | `/namespaces/{ns}/stats` | Per-namespace stats. |
+| `GET` | `/health` | Health check. |
+
+```bash
+# Upload
+curl -X PUT localhost:8080/namespaces/default/blobs/hello.txt \
+  -H "Content-Type: text/plain" \
+  -d "hello, world"
+
+# Download (with range)
+curl -H "Range: bytes=0-4" localhost:8080/namespaces/default/blobs/hello.txt
+
+# List with pagination
+curl "localhost:8080/namespaces/default/blobs?prefix=photos/&limit=10"
+```
+
+## TypeScript Client
+
+A first-party TypeScript client lives in [`client/`](client/) with zero external
+dependencies (uses `fetch`). Supports streaming reads, cursor pagination,
+reactive `PagedBlobs`, and browser file uploads:
+
+```typescript
+import { createBlobStore } from "./client"
+
+const store = createBlobStore({ baseUrl: "http://localhost:8080" })
+
+const entry = await store.put("photos/vacation.jpg", file, { tags: { year: "2026" } })
+const stream = await store.get("photos/vacation.jpg")
+const page   = await store.list({ prefix: "photos/", limit: 20 })
+
+// Reactive pagination
+const ctrl = await store.page({ prefix: "docs/", limit: 50 })
+ctrl.subscribe((page) => console.log(page.data.length))
+
+// Browser file upload convenience
+await store.upload(fileInput.files[0]!, { prefix: "uploads" })
+```
+
+---
+
 ## Stats
 
 ```go
@@ -183,9 +244,10 @@ s, _ := ns.Stats(ctx)
 // s.DeadBytes, s.SegmentCount, s.UpdatedAt
 
 // Aggregate across all namespaces
-global, _ := store.Stats(ctx)
+global, _ := s.Stats(ctx)
 // global.TotalBlobCount, global.TotalBytesStored, global.TotalBytesPhysical,
-// global.DeduplicationRatio, global.PerNamespace
+// global.DeduplicationRatio, global.PerNamespace, global.SegmentCount,
+// global.TotalDeadBytes
 ```
 
 ---
@@ -209,19 +271,36 @@ err := ns.RebuildIndex(ctx)
 ```
 
 Scans all segment files on disk and repopulates chunk entries in the index.
-Does not reconstruct refs (those come from the WAL or a backup). Call after
-`Open` when the dirty flag indicates an unclean shutdown.
+Rebuilt blobs get `RefCount: 1` (not 0) to prevent Compact from immediately
+reaping them. Does not reconstruct ref entries — those must be re-established
+by the operator (e.g. by re-Putting known keys, which is idempotent thanks
+to content addressing). Call after `Open` when the dirty flag indicates an
+unclean shutdown.
 
-### Compact — reclaim dead space (phase 1)
+### Compact — reclaim dead space (two phases)
 
 ```go
 result, err := ns.Compact(ctx)
-// result.BlobsRemoved, result.ChunksRemoved, result.BytesFreed
+// result.BlobsRemoved, result.ChunksRemoved, result.BytesFreed,
+// result.SegmentsCompacted
 ```
 
-Walks all blobs with `RefCount == 0`, marks their page headers as deleted in
-the segment files, and removes blob/chunk entries from the index. Phase 2
-(segment rewriting to reclaim disk space) is not yet implemented.
+**Phase 1** (mark-and-sweep): walks all blobs with `RefCount == 0`, marks
+their page headers as deleted in the segment files, and removes blob/chunk
+entries from the index. Runs under a shared read guard — safe alongside
+concurrent Puts and Gets.
+
+**Phase 2** (segment rewrite): sealed segments whose dead-byte ratio exceeds
+the threshold (default 30%) are physically rewritten — live chunks copied
+into a fresh segment, the index updated, and the old segment's files removed.
+Runs under an exclusive write guard; will not start while a `Get` has an
+open reader that might still resolve to the segment being rewritten.
+
+Use `CompactWithOptions` to tune the rewrite threshold:
+
+```go
+result, err := ns.CompactWithOptions(ctx, store.CompactOptions{RewriteThreshold: 0.50})
+```
 
 ---
 
@@ -299,7 +378,7 @@ make test       # go clean -testcache && go test -v ./...
 go test -race ./...
 ```
 
-All 119 tests pass with no race conditions.
+All 142 tests pass with no race conditions.
 
 ---
 

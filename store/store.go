@@ -51,6 +51,11 @@ type Config struct {
 	// Use index.NewMemoryBackend() for tests.
 	Index index.Backend
 
+	// DefaultNamespace, if non-empty, is auto-created on Open.
+	// When empty (the zero value), no namespace is created implicitly.
+	// Set to "default" to restore the original behavior.
+	DefaultNamespace string
+
 	// Volume tuning — zero values use package defaults (16 KB page, 4 MB
 	// chunk, 512 MB segment).
 	PageSize       int
@@ -62,7 +67,12 @@ type Config struct {
 
 // PutOptions carries optional parameters for a Put call.
 type PutOptions struct {
-	// ContentType is the MIME type. Defaults to "application/octet-stream".
+	// ContentType is the MIME type. If left empty, it is detected
+	// automatically by sniffing the blob's content (via
+	// github.com/gabriel-vasile/mimetype) rather than defaulting to
+	// "application/octet-stream" outright — that fallback is now only
+	// what a genuinely undetectable stream (or a zero-byte blob) resolves
+	// to. Set this explicitly to skip detection and force a specific type.
 	ContentType string
 
 	// Custom is an arbitrary map of caller-defined metadata.
@@ -104,7 +114,8 @@ type Store struct {
 }
 
 // Open opens an existing store or creates a new one.
-// A "default" namespace is created automatically if none exist.
+// If Config.DefaultNamespace is non-empty, that namespace is
+// automatically created if it does not already exist.
 func Open(cfg Config) (*Store, error) {
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("store: Config.DataDir must not be empty")
@@ -129,17 +140,19 @@ func Open(cfg Config) (*Store, error) {
 
 	ctx := context.Background()
 
-	// Ensure the default namespace exists.
-	if _, err := s.idx.GetNamespace(ctx, object.DefaultNamespaceID); err != nil {
-		if !index.IsNotFound(err) {
-			return nil, fmt.Errorf("store: check default namespace: %w", err)
-		}
-		if err := s.idx.PutNamespace(ctx, object.Namespace{
-			ID:          object.DefaultNamespaceID,
-			DisplayName: "Default",
-			CreatedAt:   time.Now().UTC(),
-		}); err != nil {
-			return nil, fmt.Errorf("store: create default namespace: %w", err)
+	if cfg.DefaultNamespace != "" {
+		nsID := cfg.DefaultNamespace
+		if _, err := s.idx.GetNamespace(ctx, nsID); err != nil {
+			if !index.IsNotFound(err) {
+				return nil, fmt.Errorf("store: check default namespace: %w", err)
+			}
+			if err := s.idx.PutNamespace(ctx, object.Namespace{
+				ID:          nsID,
+				DisplayName: "Default",
+				CreatedAt:   time.Now().UTC(),
+			}); err != nil {
+				return nil, fmt.Errorf("store: create default namespace: %w", err)
+			}
 		}
 	}
 
@@ -149,7 +162,7 @@ func Open(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("store: list namespaces on open: %w", err)
 	}
 	for _, ns := range namespaces {
-		if err := s.openEngine(ns.ID); err != nil {
+		if err := s.openEngine(ctx, ns.ID); err != nil {
 			return nil, fmt.Errorf("store: open engine for %q: %w", ns.ID, err)
 		}
 	}
@@ -223,7 +236,7 @@ func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace) error 
 	if err := s.idx.PutNamespace(ctx, ns); err != nil {
 		return fmt.Errorf("store: persist namespace: %w", err)
 	}
-	return s.openEngine(ns.ID)
+	return s.openEngine(ctx, ns.ID)
 }
 
 // GetNamespace returns the metadata for a namespace.
@@ -322,7 +335,29 @@ func (s *Store) Stats(ctx context.Context) (*object.StoreStats, error) {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-func (s *Store) openEngine(nsID string) error {
+// openEngine opens nsID's volume engine and, before making it available to
+// any caller, replays its WAL: for every durably-committed WriteBlob group
+// found in a WAL file whose blob has no BlobEntry yet in the index — i.e.
+// WriteBlob completed and fsynced, but the process crashed before
+// CommitPut (ref + blob manifest) finished — its BlobEntry and
+// ChunkEntry records are written now.
+//
+// This mirrors RebuildIndex's approach and inherits the same reasoning
+// for RefCount: 1 rather than 0 (see RebuildIndex's doc comment) — a
+// replayed blob has no way to carry forward its real reference count
+// (that mapping lives only in RefEntry, which nothing durable recorded
+// for an interrupted Put), so it is registered as presumed-referenced
+// rather than immediately reapable. An operator (or the original,
+// presumably-retried caller) re-establishes real refs by Put-ing the
+// same content again — safe and idempotent thanks to content addressing.
+//
+// This runs on every openEngine call, not just after a real crash: for a
+// namespace with no unreplayed WAL entries (the overwhelmingly common
+// case — a clean prior shutdown, or a brand new namespace with no
+// segments at all), it costs one cheap directory listing
+// (ListSegmentIDs) and reads each segment's small WAL file, not a full
+// segment scan.
+func (s *Store) openEngine(ctx context.Context, nsID string) error {
 	eng, err := volume.Open(s.cfg.DataDir, nsID, volume.Options{
 		PageSize:       s.cfg.PageSize,
 		ChunkSize:      s.cfg.ChunkSize,
@@ -331,7 +366,63 @@ func (s *Store) openEngine(nsID string) error {
 	if err != nil {
 		return err
 	}
+	if err := s.replayWAL(ctx, nsID, eng); err != nil {
+		_ = eng.Close()
+		return fmt.Errorf("replay WAL: %w", err)
+	}
 	s.engines[nsID] = eng
+	return nil
+}
+
+// replayWAL parses every segment's WAL file for eng and registers any
+// not-yet-committed blob it finds. See openEngine's doc comment for the
+// full rationale.
+func (s *Store) replayWAL(ctx context.Context, nsID string, eng *volume.Engine) error {
+	segIDs, err := eng.ListSegmentIDs()
+	if err != nil {
+		return fmt.Errorf("list segments for %q: %w", nsID, err)
+	}
+
+	for _, segID := range segIDs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		entries, err := eng.ParseWAL(segID)
+		if err != nil {
+			return fmt.Errorf("parse WAL for segment %s: %w", segID, err)
+		}
+
+		for _, entry := range entries {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if _, err := s.idx.GetBlob(ctx, entry.BlobID); err == nil {
+				continue // already committed via CommitPut — nothing to replay
+			} else if !index.IsNotFound(err) {
+				return fmt.Errorf("check blob %s: %w", entry.BlobID, err)
+			}
+
+			var totalSize int64
+			chunkIDs := make([]object.ChunkID, len(entry.Chunks))
+			for _, c := range entry.Chunks {
+				if err := s.idx.PutChunk(ctx, c); err != nil {
+					return fmt.Errorf("replay chunk %s: %w", c.ChunkID, err)
+				}
+				totalSize += c.Length
+				chunkIDs[c.Seq] = c.ChunkID
+			}
+
+			if err := s.idx.PutBlob(ctx, object.BlobEntry{
+				BlobID:    entry.BlobID,
+				ChunkIDs:  chunkIDs,
+				TotalSize: totalSize,
+				RefCount:  1, // presumed referenced — see openEngine's doc comment
+			}); err != nil {
+				return fmt.Errorf("replay blob %s: %w", entry.BlobID, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -382,6 +473,45 @@ func (s *Store) beginNSOp(nsID string) (*volume.Engine, error) {
 	return eng, nil
 }
 
+// beginExclusiveOp acquires the store's write lock — the same lock Close
+// takes — for an operation that must run with nothing else touching the
+// store concurrently. Unlike beginOp/beginNSOp, which allow any number of
+// concurrent readers, this blocks every other operation, on every
+// namespace, until endExclusiveOp is called. That's a real throughput
+// cost, so it is used sparingly: today, only by Compact's phase 2 segment
+// rewrite, which physically relocates live chunks' bytes and therefore
+// must not run while a Get elsewhere might still be reading from the old
+// location (see beginOp's doc comment on why a Get's guard outlives the
+// Get call itself — this is what makes that guarantee airtight here too).
+// It returns *errors.ClosedError if the store is already closed.
+func (s *Store) beginExclusiveOp() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return &bserrors.ClosedError{}
+	}
+	return nil
+}
+
+// endExclusiveOp releases the guard acquired by beginExclusiveOp or
+// beginExclusiveNSOp.
+func (s *Store) endExclusiveOp() {
+	s.mu.Unlock()
+}
+
+// beginExclusiveNSOp is beginExclusiveOp plus a namespace engine lookup.
+func (s *Store) beginExclusiveNSOp(nsID string) (*volume.Engine, error) {
+	if err := s.beginExclusiveOp(); err != nil {
+		return nil, err
+	}
+	eng, ok := s.engines[nsID]
+	if !ok {
+		s.endExclusiveOp()
+		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
+	}
+	return eng, nil
+}
+
 // ── NamespaceHandle ───────────────────────────────────────────────────────────
 
 // NamespaceHandle is the primary interaction surface for callers.
@@ -410,13 +540,19 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 	}
 	defer h.store.endOp()
 
+	// Content-type detection reads from r before WriteBlob does, and that
+	// read can block on slow caller I/O exactly like WriteBlob's own reads
+	// can — so it must happen after the guard above, not before it. If it
+	// ran before beginNSOp, a Put stalled mid-sniff would not yet be
+	// "in flight" as far as Store.Close is concerned, and Close could
+	// complete out from under it (see Close's doc comment: every
+	// operation must hold the guard for its full duration, not just the
+	// part after its first blocking read).
 	if opts.ContentType == "" {
-		head, err := peekForMIME(r)
+		r, opts.ContentType, err = detectContentType(r)
 		if err != nil {
-			return nil, fmt.Errorf("store: detect mime type: %w", err)
+			return nil, fmt.Errorf("store: detect content type: %w", err)
 		}
-		opts.ContentType = mimetype.Detect(head.Bytes()).String()
-		r = io.MultiReader(head, r)
 	}
 
 	// VULN 8 fix: acquire the per-namespace quota mutex before reading stats
@@ -567,39 +703,6 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-// UpdateMetadata updates the ContentType and/or Custom metadata for an
-// existing blob without rewriting its content. Size, BlobID, and CreatedAt
-// are preserved from the stored ref; UpdatedAt is set to the current time.
-// Returns *errors.NotFoundError if key does not exist.
-func (h *NamespaceHandle) UpdateMetadata(ctx context.Context, key, contentType string, custom map[string]string) (*object.BlobInfo, error) {
-	if err := validateKey(key); err != nil {
-		return nil, err
-	}
-	if err := h.store.beginOp(); err != nil {
-		return nil, err
-	}
-	defer h.store.endOp()
-
-	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
-	if err != nil {
-		return nil, err
-	}
-
-	ref.Metadata.ContentType = contentType
-	ref.Metadata.Custom = custom
-	ref.Metadata.UpdatedAt = time.Now().UTC()
-
-	if err := h.store.idx.PutRef(ctx, *ref); err != nil {
-		return nil, err
-	}
-
-	return &object.BlobInfo{
-		Key:         key,
-		NamespaceID: h.nsID,
-		Metadata:    ref.Metadata,
-	}, nil
-}
-
 // List returns BlobInfo for blobs in this namespace matching opts.
 // Results are in lexicographic key order.
 func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.BlobInfo, error) {
@@ -686,6 +789,41 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 // RebuildIndex reconstructs chunk entries in the index by scanning all segment
 // files on disk. Should be called after Open when IsDirty() is true.
 // It does not reconstruct refs — those can only come from the WAL or a backup.
+// RebuildIndex reconstructs this namespace's index records by scanning
+// every segment file directly — the disaster-recovery path for when the
+// index itself has been lost or corrupted but the segment files are
+// intact. It rebuilds two things, in this order:
+//
+//  1. Every chunk's ChunkEntry (location on disk), skipping any page
+//     already flagged deleted.
+//  2. Every blob's BlobEntry (ordered ChunkIDs, TotalSize), reconstructed
+//     from the BlobID and TotalChunks that are already stored in every
+//     page's header — grouping by BlobID and checking each group's chunk
+//     count against TotalChunks tells us whether a blob's chunks are all
+//     present (a mid-write crash could leave a blob's later chunks
+//     missing from disk entirely, not just uncommitted).
+//
+// Step 2 matters more than it looks: without it, a rebuilt index would
+// contain ChunkEntry records with no owning BlobEntry for ANY blob,
+// including every blob that was fully, correctly committed before the
+// index was lost. Compact's orphan sweep treats "no BlobEntry" as
+// garbage — so skipping this step would mean the very next Compact call
+// deletes everything RebuildIndex just recovered.
+//
+// Rebuilt blobs get RefCount: 1, not RefCount: 0. RebuildIndex, scanning
+// only physical segment files, has no way to know how many keys actually
+// point at a given blob — that mapping lives in RefEntry, which this
+// method does not and cannot reconstruct (a key's mapping existing only
+// in a lost index is unrecoverable from disk alone). RefCount: 0 would
+// look like a conservative default, but Compact's phase 1 treats
+// RefCount == 0 as immediately reapable — so it would produce the exact
+// same data loss as skipping step 2 entirely, just via a different code
+// path. RefCount: 1 means a rebuilt blob is not touched by Compact until
+// an operator re-establishes its real refs (e.g. by re-Put-ing known
+// keys — safe and idempotent thanks to content addressing) or explicitly
+// intervenes; that trades a disk-space leak for recovered blobs nobody
+// re-links against the much worse alternative of silently deleting data
+// an operator is still in the middle of recovering.
 func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
@@ -693,25 +831,147 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 	}
 	defer h.store.endOp()
 
-	return eng.ScanSegments(func(entry object.ChunkEntry, _ volume.PageHeader) error {
+	type blobAccum struct {
+		chunkIDs    map[int]object.ChunkID // by Seq, so out-of-order page scans still assemble correctly
+		totalSize   int64
+		totalChunks uint32
+	}
+	blobs := make(map[object.BlobID]*blobAccum)
+
+	if err := eng.ScanSegments(func(entry object.ChunkEntry, hdr volume.PageHeader) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return h.store.idx.PutChunk(ctx, entry)
-	})
+		if hdr.Flags.IsDeleted() {
+			return nil // dead page — do not resurrect it into the rebuilt index
+		}
+		if err := h.store.idx.PutChunk(ctx, entry); err != nil {
+			return fmt.Errorf("rebuild chunk %s: %w", entry.ChunkID, err)
+		}
+
+		acc, ok := blobs[entry.BlobID]
+		if !ok {
+			acc = &blobAccum{chunkIDs: make(map[int]object.ChunkID)}
+			blobs[entry.BlobID] = acc
+		}
+		acc.chunkIDs[entry.Seq] = entry.ChunkID
+		acc.totalSize += entry.Length
+		if hdr.TotalChunks > acc.totalChunks {
+			acc.totalChunks = hdr.TotalChunks
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("store: rebuild index scan: %w", err)
+	}
+
+	for blobID, acc := range blobs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if uint32(len(acc.chunkIDs)) != acc.totalChunks {
+			// A crash mid-write can leave a blob's later chunks never
+			// written to disk at all (not merely uncommitted — physically
+			// absent). Such a blob can never be reassembled correctly, so
+			// it must not get a BlobEntry: that would make it look
+			// complete and retrievable when reading it back would fail or
+			// return truncated data partway through. Its chunks were
+			// already registered as ChunkEntry above; without a BlobEntry
+			// they're orphaned and Compact will reclaim them normally.
+			continue
+		}
+		orderedChunkIDs := make([]object.ChunkID, acc.totalChunks)
+		for seq, cid := range acc.chunkIDs {
+			orderedChunkIDs[seq] = cid
+		}
+		if err := h.store.idx.PutBlob(ctx, object.BlobEntry{
+			BlobID:    blobID,
+			ChunkIDs:  orderedChunkIDs,
+			TotalSize: acc.totalSize,
+			// RefCount is set to 1, not 0, and this is deliberate, not a
+			// placeholder. RebuildIndex has no way to know a blob's real
+			// reference count — that mapping lives entirely in RefEntry
+			// records, which were lost along with the index and cannot be
+			// reconstructed from segment files. Compact's phase 1 treats
+			// RefCount == 0 as "safe to reap right now." If RebuildIndex
+			// set RefCount to 0 here, the very next Compact call would
+			// delete every blob it just restored — via a different code
+			// path than the pre-fix bug, but with the identical
+			// data-loss outcome. Given the choice between "a truly
+			// unreferenced blob leaks disk space until an operator
+			// explicitly reaps it" and "a blob an operator is mid-recovery
+			// on gets silently deleted the moment they run routine
+			// maintenance," this errs toward the former. An operator doing
+			// disaster recovery is expected to re-establish real refs
+			// (e.g. by re-Put-ing known keys, which is idempotent thanks
+			// to content addressing) before relying on Compact again.
+			RefCount: 1,
+			// CreatedAt is left zero-valued: page headers do not carry a
+			// timestamp, so when a blob's original CreatedAt has to be
+			// reconstructed from segment scans alone, there is no source
+			// for it. Reporting a fabricated "now" would be more
+			// misleading than an honest zero value.
+		}); err != nil {
+			return fmt.Errorf("store: rebuild blob %s: %w", blobID, err)
+		}
+	}
+
+	return nil
 }
 
-// Compact marks orphaned chunks deleted and returns stats on reclaimed space.
-// "Orphaned" means the chunk's blob has RefCount == 0.
-// This is a multi-phase operation:
-//  1. Walk all blob entries; collect BlobIDs with RefCount == 0.
-//  2. For each such blob, mark all its chunks deleted in the segment.
-//  3. Remove the blob and chunk index entries.
-//  4. Update stats.
+// Compact reclaims space in two phases:
 //
-// Physical segment rewriting (to reclaim actual disk space) is not yet
-// implemented — that is Phase 2 of compaction (segment merge/rewrite).
+//  1. Mark-and-sweep (always runs): walk all blob entries, collect
+//     BlobIDs with RefCount == 0, mark their chunks deleted in the
+//     segment, and remove their blob/chunk index records. This runs
+//     under the shared store guard (see beginNSOp) — it only flips a flag
+//     on chunks nothing references anymore, so it's safe alongside other
+//     namespaces', and this namespace's, concurrent Puts and Gets.
+//
+//  2. Segment rewrite (this namespace's sealed segments only): any sealed
+//     segment whose dead-byte ratio is >= the configured threshold
+//     (CompactOptions.RewriteThreshold, default
+//     volume.DefaultSegmentRewriteThreshold) is physically rewritten —
+//     its live chunks copied into a fresh segment, the index updated to
+//     point at the new locations, and the old segment's files removed.
+//     This DOES relocate live chunks' physical bytes, so it runs under
+//     the store's exclusive guard (see beginExclusiveNSOp): it will not
+//     start while a Get elsewhere has an open reader that might still
+//     resolve to the segment being rewritten, and nothing new can start
+//     until it finishes. This is the same store-wide tradeoff
+//     CreateNamespace/DeleteNamespace already make — Compact is a
+//     deliberate, occasional maintenance operation, not a hot path.
+//
+// If phase 1 fails, phase 2 does not run and the phase 1 error is
+// returned. If phase 1 succeeds but phase 2 fails, the phase 1 results
+// are still returned alongside the phase 2 error — phase 1's work is
+// already durably committed at that point and does not need retrying.
 func (h *NamespaceHandle) Compact(ctx context.Context) (CompactResult, error) {
+	return h.CompactWithOptions(ctx, CompactOptions{})
+}
+
+// CompactWithOptions is Compact with a tunable rewrite threshold. See
+// Compact's doc comment for what each phase does.
+func (h *NamespaceHandle) CompactWithOptions(ctx context.Context, opts CompactOptions) (CompactResult, error) {
+	opts = opts.withDefaults()
+
+	result, err := h.compactPhase1(ctx)
+	if err != nil {
+		return result, err
+	}
+
+	bytesFreed, segmentsCompacted, err := h.compactPhase2(ctx, opts.RewriteThreshold)
+	if err != nil {
+		return result, fmt.Errorf("store: compact phase 2 (segment rewrite): %w", err)
+	}
+	result.BytesFreed += bytesFreed
+	result.SegmentsCompacted = segmentsCompacted
+
+	return result, nil
+}
+
+// compactPhase1 marks orphaned chunks deleted and removes their index
+// records. See Compact's doc comment.
+func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, error) {
 	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return CompactResult{}, err
@@ -721,9 +981,9 @@ func (h *NamespaceHandle) Compact(ctx context.Context) (CompactResult, error) {
 	// Collect all chunk entries that belong to blobs with RefCount == 0.
 	// We scan segment files (the ground truth) and cross-reference the index.
 	var (
-		deadChunks []object.ChunkEntry
-		deadBlobs  []object.BlobID
-		bytesFreed int64
+		deadChunks  []object.ChunkEntry
+		deadBlobs   []object.BlobID
+		bytesFreed  int64
 		chunksFreed int64
 	)
 
@@ -783,22 +1043,120 @@ func (h *NamespaceHandle) Compact(ctx context.Context) (CompactResult, error) {
 	}, nil
 }
 
-// CompactResult summarises what Compact reclaimed.
-type CompactResult struct {
-	BlobsRemoved  int64
-	ChunksRemoved int64
-	BytesFreed    int64
+// compactPhase2 physically rewrites sealed segments whose dead-byte ratio
+// meets threshold, reclaiming disk space. See Compact's doc comment for
+// the locking and crash-safety rationale.
+func (h *NamespaceHandle) compactPhase2(ctx context.Context, threshold float64) (bytesFreed int64, segmentsCompacted int64, err error) {
+	eng, err := h.store.beginExclusiveNSOp(h.nsID)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer h.store.endExclusiveOp()
+
+	stats, err := eng.SegmentStats()
+	if err != nil {
+		return 0, 0, fmt.Errorf("segment stats: %w", err)
+	}
+	activeID, hasActive := eng.ActiveSegmentID()
+
+	for _, s := range stats {
+		if ctx.Err() != nil {
+			return bytesFreed, segmentsCompacted, ctx.Err()
+		}
+		if hasActive && s.SegmentID == activeID {
+			continue // never rewrite the segment still being written to
+		}
+		if s.DeadRatio() < threshold {
+			continue
+		}
+
+		rewriteResult, relocated, err := eng.RewriteSegment(s.SegmentID)
+		if err != nil {
+			return bytesFreed, segmentsCompacted, fmt.Errorf("rewrite segment %s: %w", s.SegmentID, err)
+		}
+
+		// Commit every relocated chunk's new location to the index BEFORE
+		// removing the old segment's files. If the process crashes here,
+		// both the old and new segment files still exist, so every
+		// ChunkEntry — whether its index record has been updated yet or
+		// not — still resolves to valid data; the only cost of a crash
+		// mid-loop is that this segment's space isn't reclaimed yet, and
+		// the next Compact call simply retries it.
+		for _, entry := range relocated {
+			if err := h.store.idx.PutChunk(ctx, entry); err != nil {
+				return bytesFreed, segmentsCompacted, fmt.Errorf(
+					"relocate chunk %s to segment %s: %w", entry.ChunkID, rewriteResult.NewSegmentID, err,
+				)
+			}
+		}
+
+		// Only now is it safe to remove the old segment's files.
+		if err := eng.DeleteSegmentFile(s.SegmentID); err != nil {
+			return bytesFreed, segmentsCompacted, fmt.Errorf("delete old segment %s: %w", s.SegmentID, err)
+		}
+
+		bytesFreed += rewriteResult.BytesFreed
+		segmentsCompacted++
+	}
+
+	return bytesFreed, segmentsCompacted, nil
 }
 
-// peekForMIME reads up to 3072 bytes from r for MIME type detection
-// and returns them in a buffer, preserving r for subsequent reading.
-func peekForMIME(r io.Reader) (*bytes.Buffer, error) {
-	var head bytes.Buffer
-	_, err := io.CopyN(&head, r, 3072)
-	if err != nil && err != io.EOF {
-		return nil, err
+// CompactOptions tunes Compact's phase 2 (segment rewrite).
+type CompactOptions struct {
+	// RewriteThreshold is the minimum dead-byte ratio (0.0–1.0, by page
+	// count) a sealed segment must reach before it is physically
+	// rewritten to reclaim space. Zero uses
+	// volume.DefaultSegmentRewriteThreshold (0.30).
+	RewriteThreshold float64
+}
+
+func (o CompactOptions) withDefaults() CompactOptions {
+	if o.RewriteThreshold == 0 {
+		o.RewriteThreshold = volume.DefaultSegmentRewriteThreshold
 	}
-	return &head, nil
+	return o
+}
+
+// CompactResult summarises what Compact reclaimed.
+type CompactResult struct {
+	BlobsRemoved      int64
+	ChunksRemoved     int64
+	BytesFreed        int64 // phase 1 (orphaned-chunk bytes) + phase 2 (physically reclaimed bytes)
+	SegmentsCompacted int64 // sealed segments physically rewritten and removed by phase 2
+}
+
+// ── Content-type detection ───────────────────────────────────────────────────
+
+// mimeSniffLimit is how many leading bytes of a blob are read for content-type
+// detection. This matches mimetype.Detect's own default header size (3072
+// bytes) — sniffing beyond what the detector itself would ever look at
+// would just mean holding more of the stream in memory for no benefit.
+const mimeSniffLimit = 3072
+
+// detectContentType peeks up to mimeSniffLimit bytes from r to sniff its
+// MIME type, then returns a reader that reproduces the exact original
+// stream — the peeked prefix followed by whatever remains of r — so the
+// caller (Put) can hand it to WriteBlob exactly as if no peeking had
+// happened. r itself must not be read from again after this call; use only
+// the returned reader.
+//
+// A blob shorter than mimeSniffLimit is not an error: io.ReadFull reports
+// io.EOF (zero bytes available at all) or io.ErrUnexpectedEOF (fewer bytes
+// than requested) in that case, and both are expected outcomes here, not
+// failures — they just mean the entire blob was small enough to fit in the
+// sniff buffer already. Any other read error is real and is propagated;
+// mimetype.Detect itself never errors — its worst case is falling back to
+// "application/octet-stream", the same default this replaces.
+func detectContentType(r io.Reader) (io.Reader, string, error) {
+	buf := make([]byte, mimeSniffLimit)
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, "", err
+	}
+	peeked := buf[:n]
+	detected := mimetype.Detect(peeked).String()
+	return io.MultiReader(bytes.NewReader(peeked), r), detected, nil
 }
 
 // ── Quota check ───────────────────────────────────────────────────────────────
