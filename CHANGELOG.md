@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/asaidimu/blobs/compare/v1.2.0...v1.2.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* Drop default namespaces ([e2b8d54](https://github.com/asaidimu/blobs/commit/e2b8d54bb4e66009544e59e6702e06d225035e99))
+
 # [1.2.0](https://github.com/asaidimu/blobs/compare/v1.1.0...v1.2.0) (2026-07-21)
 
 
