@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/asaidimu/blobs/compare/v1.1.0...v1.2.0) (2026-07-21)
+
+
+### Features
+
+* add Update and Rename methods to NamespaceHandle ([5b79230](https://github.com/asaidimu/blobs/commit/5b79230c0727ebb7afd6ac5f3027a76f79b98638))
+
 # [1.1.0](https://github.com/asaidimu/blobs/compare/v1.0.2...v1.1.0) (2026-07-20)
 
 
