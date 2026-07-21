@@ -684,6 +684,44 @@ func (h *NamespaceHandle) Head(ctx context.Context, key string) (*object.BlobInf
 	}, nil
 }
 
+// Update replaces the custom metadata on a blob. It does not affect the
+// blob's content, content type, or any other metadata field.
+// Returns NotFoundError if the key does not exist.
+func (h *NamespaceHandle) Update(ctx context.Context, key string, metadata map[string]any) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if err := h.store.beginOp(); err != nil {
+		return err
+	}
+	defer h.store.endOp()
+
+	custom := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		custom[k] = fmt.Sprint(v)
+	}
+
+	return h.store.idx.CommitUpdateRefMetadata(ctx, h.nsID, key, custom, time.Now())
+}
+
+// Rename atomically renames a blob from oldKey to newKey.
+// Returns NotFoundError if oldKey does not exist.
+// Returns an error if newKey already exists.
+func (h *NamespaceHandle) Rename(ctx context.Context, oldKey, newKey string) error {
+	if err := validateKey(oldKey); err != nil {
+		return err
+	}
+	if err := validateKey(newKey); err != nil {
+		return err
+	}
+	if err := h.store.beginOp(); err != nil {
+		return err
+	}
+	defer h.store.endOp()
+
+	return h.store.idx.CommitRenameRef(ctx, h.nsID, oldKey, newKey)
+}
+
 // Delete removes the ref for key, making its blob GC-eligible.
 // Physical bytes are not reclaimed until Compact is called.
 // Returns nil if the key does not exist (idempotent).
@@ -1202,6 +1240,14 @@ func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) er
 			Dimension:   "bytes",
 			Limit:       q.MaxBytes,
 			Requested:   stats.BytesStored + incomingSize,
+		}
+	}
+	if q.MaxBlobSize > 0 && incomingSize > q.MaxBlobSize {
+		return &bserrors.QuotaExceededError{
+			NamespaceID: h.nsID,
+			Dimension:   "blob_size",
+			Limit:       q.MaxBlobSize,
+			Requested:   incomingSize,
 		}
 	}
 	return nil

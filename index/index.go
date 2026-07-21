@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/object"
@@ -454,6 +455,63 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 		stats.DeadBytes += ref.Metadata.Size
 		stats.DeadChunks += int64(ref.Metadata.ChunkCount)
 		return putStatsTx(tx, stats)
+	})
+}
+
+// CommitRenameRef atomically renames a ref from oldKey to newKey.
+// Returns NotFoundError if oldKey does not exist.
+// Returns an error if newKey already exists.
+func (idx *Index) CommitRenameRef(ctx context.Context, nsID, oldKey, newKey string) error {
+	return idx.b.Tx(ctx, func(tx Tx) error {
+		oldRaw, err := tx.Get(keyRef(nsID, oldKey))
+		if err != nil {
+			return err
+		}
+		var ref object.RefEntry
+		if err := unmarshal(oldRaw, &ref); err != nil {
+			return err
+		}
+
+		_, err = tx.Get(keyRef(nsID, newKey))
+		if err == nil {
+			return fmt.Errorf("index: key %q already exists in namespace %q", newKey, nsID)
+		}
+		if !IsNotFound(err) {
+			return err
+		}
+
+		ref.Key = newKey
+		v, err := marshal(ref)
+		if err != nil {
+			return err
+		}
+		if err := tx.Put(keyRef(nsID, newKey), v); err != nil {
+			return err
+		}
+		return tx.Delete(keyRef(nsID, oldKey))
+	})
+}
+
+// CommitUpdateRefMetadata atomically updates the custom metadata and
+// updated-at timestamp of an existing ref entry. Returns NotFoundError
+// if the key does not exist.
+func (idx *Index) CommitUpdateRefMetadata(ctx context.Context, nsID, key string, custom map[string]string, updatedAt time.Time) error {
+	return idx.b.Tx(ctx, func(tx Tx) error {
+		raw, err := tx.Get(keyRef(nsID, key))
+		if err != nil {
+			return err
+		}
+		var ref object.RefEntry
+		if err := unmarshal(raw, &ref); err != nil {
+			return err
+		}
+		ref.Metadata.Custom = custom
+		ref.Metadata.UpdatedAt = updatedAt
+		v, err := marshal(ref)
+		if err != nil {
+			return err
+		}
+		return tx.Put(keyRef(nsID, key), v)
 	})
 }
 

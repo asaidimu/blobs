@@ -282,6 +282,178 @@ func TestCustomMetadata(t *testing.T) {
 	}
 }
 
+func TestUpdate_Metadata(t *testing.T) {
+	s := openStore(t)
+	ns := s.Namespace(object.DefaultNamespaceID)
+	ctx := context.Background()
+
+	original := []byte("some content")
+	putBytes(t, ns, "updatable", original)
+
+	// Set initial custom metadata via Put.
+	_, err := ns.Put(ctx, "updatable", bytes.NewReader(original), store.PutOptions{
+		ContentType: "text/plain",
+		Custom:      map[string]string{"initial": "yes"},
+	})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	before, err := ns.Head(ctx, "updatable")
+	if err != nil {
+		t.Fatalf("Head before update: %v", err)
+	}
+
+	// Update with mixed value types.
+	err = ns.Update(ctx, "updatable", map[string]any{
+		"author":  "alice",
+		"version": 2,
+		"enabled": true,
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	after, err := ns.Head(ctx, "updatable")
+	if err != nil {
+		t.Fatalf("Head after update: %v", err)
+	}
+
+	// Custom metadata should be replaced.
+	if after.Metadata.Custom["author"] != "alice" {
+		t.Errorf("custom[author]: got %q, want alice", after.Metadata.Custom["author"])
+	}
+	if after.Metadata.Custom["version"] != "2" {
+		t.Errorf("custom[version]: got %q, want 2", after.Metadata.Custom["version"])
+	}
+	if after.Metadata.Custom["enabled"] != "true" {
+		t.Errorf("custom[enabled]: got %q, want true", after.Metadata.Custom["enabled"])
+	}
+	if _, ok := after.Metadata.Custom["initial"]; ok {
+		t.Error("custom[initial] should have been replaced")
+	}
+
+	// Immutable fields should be preserved.
+	if after.Metadata.ContentType != "text/plain" {
+		t.Errorf("ContentType changed: got %q", after.Metadata.ContentType)
+	}
+	if after.Metadata.Size != before.Metadata.Size {
+		t.Errorf("Size changed: got %d, want %d", after.Metadata.Size, before.Metadata.Size)
+	}
+	if after.Metadata.BlobID != before.Metadata.BlobID {
+		t.Errorf("BlobID changed")
+	}
+
+	// UpdatedAt should advance.
+	if !after.Metadata.UpdatedAt.After(before.Metadata.UpdatedAt) {
+		t.Error("UpdatedAt did not advance")
+	}
+
+	// Content should be untouched.
+	got := getBytes(t, ns, "updatable")
+	if !bytes.Equal(got, original) {
+		t.Fatal("blob content changed after metadata update")
+	}
+}
+
+func TestUpdate_NotFound(t *testing.T) {
+	s := openStore(t)
+	ns := s.Namespace(object.DefaultNamespaceID)
+	ctx := context.Background()
+
+	err := ns.Update(ctx, "does-not-exist", map[string]any{"foo": "bar"})
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	var nfe *bserrors.NotFoundError
+	if !isAs(err, &nfe) {
+		t.Errorf("expected *NotFoundError; got %T", err)
+	}
+}
+
+func TestRename(t *testing.T) {
+	s := openStore(t)
+	ns := s.Namespace(object.DefaultNamespaceID)
+	ctx := context.Background()
+
+	original := []byte("renamable content")
+	putBytes(t, ns, "old-key", original)
+
+	info, err := ns.Head(ctx, "old-key")
+	if err != nil {
+		t.Fatalf("Head before rename: %v", err)
+	}
+
+	err = ns.Rename(ctx, "old-key", "new-key")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	// Old key should be gone.
+	_, err = ns.Get(ctx, "old-key")
+	var nfe *bserrors.NotFoundError
+	if !isAs(err, &nfe) {
+		t.Errorf("expected *NotFoundError for old key; got %T", err)
+	}
+
+	// New key should have the content.
+	got := getBytes(t, ns, "new-key")
+	if !bytes.Equal(got, original) {
+		t.Fatal("content mismatch after rename")
+	}
+
+	// Metadata should be preserved.
+	renamed, err := ns.Head(ctx, "new-key")
+	if err != nil {
+		t.Fatalf("Head after rename: %v", err)
+	}
+	if renamed.Metadata.Size != info.Metadata.Size {
+		t.Errorf("Size changed: got %d, want %d", renamed.Metadata.Size, info.Metadata.Size)
+	}
+	if renamed.Metadata.BlobID != info.Metadata.BlobID {
+		t.Errorf("BlobID changed")
+	}
+}
+
+func TestRename_TargetExists(t *testing.T) {
+	s := openStore(t)
+	ns := s.Namespace(object.DefaultNamespaceID)
+	ctx := context.Background()
+
+	putBytes(t, ns, "key-a", []byte("data a"))
+	putBytes(t, ns, "key-b", []byte("data b"))
+
+	err := ns.Rename(ctx, "key-a", "key-b")
+	if err == nil {
+		t.Fatal("expected error when target exists; got nil")
+	}
+
+	// Both original keys should still be intact.
+	gotA := getBytes(t, ns, "key-a")
+	if string(gotA) != "data a" {
+		t.Errorf("key-a: got %q", gotA)
+	}
+	gotB := getBytes(t, ns, "key-b")
+	if string(gotB) != "data b" {
+		t.Errorf("key-b: got %q", gotB)
+	}
+}
+
+func TestRename_NotFound(t *testing.T) {
+	s := openStore(t)
+	ns := s.Namespace(object.DefaultNamespaceID)
+	ctx := context.Background()
+
+	err := ns.Rename(ctx, "does-not-exist", "new-key")
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	var nfe *bserrors.NotFoundError
+	if !isAs(err, &nfe) {
+		t.Errorf("expected *NotFoundError; got %T", err)
+	}
+}
+
 func TestMultipleNamespaces_Isolation(t *testing.T) {
 	s := openStore(t)
 	ctx := context.Background()
@@ -404,6 +576,33 @@ func TestQuota_Bytes(t *testing.T) {
 	_, err := ns.Put(ctx, "big", bytes.NewReader(randBytes(200)), store.PutOptions{})
 	if err == nil {
 		t.Fatal("expected quota error for oversized write; got nil")
+	}
+}
+
+func TestQuota_MaxBlobSize(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	s.CreateNamespace(ctx, object.Namespace{
+		ID:    "size-capped",
+		Quota: &object.Quota{MaxBlobSize: 50},
+	})
+	ns := s.Namespace("size-capped")
+
+	// Small blob should succeed.
+	putBytes(t, ns, "small", []byte("hello"))
+
+	// Oversized blob should be rejected.
+	_, err := ns.Put(ctx, "big", bytes.NewReader(randBytes(100)), store.PutOptions{})
+	if err == nil {
+		t.Fatal("expected quota error for oversized blob; got nil")
+	}
+	var qe *bserrors.QuotaExceededError
+	if !isAs(err, &qe) {
+		t.Errorf("expected QuotaExceededError; got %T: %v", err, err)
+	}
+	if qe.Dimension != "blob_size" {
+		t.Errorf("Dimension: got %q, want blob_size", qe.Dimension)
 	}
 }
 
