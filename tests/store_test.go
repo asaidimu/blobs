@@ -22,9 +22,8 @@ func openStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store.Open(store.Config{
-		DataDir:          dir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -34,6 +33,10 @@ func openStore(t *testing.T) *store.Store {
 			t.Errorf("Close: %v", err)
 		}
 	})
+	ctx := context.Background()
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	return s
 }
 
@@ -71,7 +74,7 @@ func getBytes(t *testing.T, ns *store.NamespaceHandle, key string) []byte {
 
 func TestRoundTrip_Small(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	original := []byte("hello, blobstore!")
@@ -98,7 +101,7 @@ func TestRoundTrip_Small(t *testing.T) {
 func TestRoundTrip_Large(t *testing.T) {
 	// Write a blob larger than the default chunk size (4 MB) to exercise chunking.
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 
 	const size = 10 * 1024 * 1024 // 10 MB — spans multiple chunks
 	original := randBytes(size)
@@ -116,7 +119,7 @@ func TestRoundTrip_Large(t *testing.T) {
 
 func TestRoundTrip_Empty(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	_, err := ns.Put(context.Background(), "empty", bytes.NewReader(nil), store.PutOptions{})
 	if err == nil {
 		t.Fatal("expected error storing empty blob; got nil")
@@ -125,7 +128,7 @@ func TestRoundTrip_Empty(t *testing.T) {
 
 func TestDeduplication(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	data := randBytes(1024)
@@ -158,7 +161,7 @@ func TestDeduplication(t *testing.T) {
 
 func TestOverwrite(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	original := []byte("version 1")
@@ -188,7 +191,7 @@ func TestOverwrite(t *testing.T) {
 
 func TestDelete_Idempotent(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	putBytes(t, ns, "to-delete", []byte("bye"))
@@ -213,7 +216,7 @@ func TestDelete_Idempotent(t *testing.T) {
 
 func TestList(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	keys := []string{"alpha", "beta", "gamma", "delta"}
@@ -251,7 +254,7 @@ func TestList(t *testing.T) {
 
 func TestCustomMetadata(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	custom := map[string]string{
@@ -284,7 +287,7 @@ func TestCustomMetadata(t *testing.T) {
 
 func TestUpdate_Metadata(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	original := []byte("some content")
@@ -358,7 +361,7 @@ func TestUpdate_Metadata(t *testing.T) {
 
 func TestUpdate_NotFound(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	err := ns.Update(ctx, "does-not-exist", map[string]any{"foo": "bar"})
@@ -373,7 +376,7 @@ func TestUpdate_NotFound(t *testing.T) {
 
 func TestRename(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	original := []byte("renamable content")
@@ -417,7 +420,7 @@ func TestRename(t *testing.T) {
 
 func TestRename_TargetExists(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	putBytes(t, ns, "key-a", []byte("data a"))
@@ -441,7 +444,7 @@ func TestRename_TargetExists(t *testing.T) {
 
 func TestRename_NotFound(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	err := ns.Rename(ctx, "does-not-exist", "new-key")
@@ -497,7 +500,7 @@ func TestMultipleNamespaces_Isolation(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
@@ -608,7 +611,7 @@ func TestQuota_MaxBlobSize(t *testing.T) {
 
 func TestVerify_Clean(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
@@ -622,27 +625,29 @@ func TestVerify_Clean(t *testing.T) {
 
 func TestVerify_Corrupted(t *testing.T) {
 	dir := t.TempDir()
+	ctx := context.Background()
 	s, err := store.Open(store.Config{
-		DataDir:          dir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatal(err)
+	}
 
-	ns := s.Namespace(object.DefaultNamespaceID)
-	ctx := context.Background()
+	ns := s.Namespace("default")
 	putBytes(t, ns, "victim", randBytes(512))
 
 	// Close cleanly so all data is flushed.
 	s.Close()
 
 	// Corrupt a segment file by flipping bytes in the middle.
-	entries, _ := os.ReadDir(dir + "/" + object.DefaultNamespaceID)
+	entries, _ := os.ReadDir(dir + "/" + "default")
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".vol") {
-			path := dir + "/" + object.DefaultNamespaceID + "/" + e.Name()
+			path := dir + "/" + "default" + "/" + e.Name()
 			data, _ := os.ReadFile(path)
 			if len(data) > 200 {
 				data[150] ^= 0xFF
@@ -655,10 +660,15 @@ func TestVerify_Corrupted(t *testing.T) {
 
 	// Re-open and verify — should detect corruption.
 	s2, err := store.Open(store.Config{
-		DataDir:          dir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dir,
+		Index:   index.NewMemoryBackend(),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatal(err)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +678,7 @@ func TestVerify_Corrupted(t *testing.T) {
 	// so Verify has nothing to check. This test validates the Verify plumbing
 	// works; a real test would use a persistent index backend. Here we
 	// at minimum confirm Verify runs without panicking on an empty index.
-	if err := s2.Namespace(object.DefaultNamespaceID).Verify(ctx); err != nil {
+	if err := s2.Namespace("default").Verify(ctx); err != nil {
 		t.Logf("Verify returned (expected on empty index after re-open): %v", err)
 	}
 }
@@ -715,15 +725,11 @@ func TestDeleteNamespace(t *testing.T) {
 		}
 	}
 
-	// Cannot delete default.
-	if err := s.DeleteNamespace(ctx, object.DefaultNamespaceID); err == nil {
-		t.Error("expected error deleting default namespace; got nil")
-	}
 }
 
 func TestCompact(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	// Write and then delete blobs to create dead bytes.
@@ -752,7 +758,7 @@ func TestCompact(t *testing.T) {
 
 func TestConcurrentPuts(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	const workers = 10
@@ -790,7 +796,7 @@ func TestConcurrentPuts(t *testing.T) {
 func TestLargeBlob_ExactChunkBoundary(t *testing.T) {
 	// Write a blob whose size is exactly one default chunk size (4 MB).
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 
 	const size = 4 * 1024 * 1024
 	original := randBytes(size)
@@ -808,7 +814,7 @@ func TestLargeBlob_ExactChunkBoundary(t *testing.T) {
 
 func TestGetNonExistent(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	_, err := ns.Get(ctx, "does-not-exist")
@@ -823,7 +829,7 @@ func TestGetNonExistent(t *testing.T) {
 
 func TestStreamingReader_MultipleReads(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	original := randBytes(9 * 1024 * 1024) // 9 MB — ~2-3 chunks

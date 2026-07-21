@@ -8,20 +8,24 @@ import (
 	"testing"
 
 	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 )
 
 func openContentTypeTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: t.TempDir(),
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	return s
 }
 

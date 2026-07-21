@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 
 	"github.com/asaidimu/blobs/index/backend"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 )
 
@@ -78,7 +79,11 @@ func writeAndClose(ctx context.Context, dataDir, indexPath string) error {
 	}
 	defer s.Close()
 
-	ns := s.Namespace("default") // "default" always exists; no CreateNamespace call needed
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		return fmt.Errorf("create namespace: %w", err)
+	}
+
+	ns := s.Namespace("default")
 
 	info, err := ns.Put(ctx, "hello.txt", bytes.NewReader([]byte("hello, blobstore")), store.PutOptions{
 		ContentType: "text/plain",

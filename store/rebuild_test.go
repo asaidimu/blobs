@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 	"github.com/asaidimu/blobs/volume"
 )
@@ -46,18 +47,20 @@ func segmentDeadPageTotals(t *testing.T, dataDir, nsID string) int {
 // practical difference) and delete everything RebuildIndex just restored.
 func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 	dataDir := t.TempDir()
+	ctx := context.Background()
 
 	// Phase 1: write real data with a real index.
 	s1, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open (phase 1): %v", err)
 	}
+	if err := s1.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	ns1 := s1.Namespace("default")
-	ctx := context.Background()
 
 	blobs := map[string]string{
 		"a.txt": "content of blob a",
@@ -84,12 +87,14 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 	// untouched on disk), but a brand-new, empty index — as if the bbolt
 	// file were deleted or corrupted and replaced.
 	s2, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(), // fresh, empty — simulates index loss
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(), // fresh, empty — simulates index loss
 	})
 	if err != nil {
 		t.Fatalf("store.Open (phase 2, fresh index): %v", err)
+	}
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns2 := s2.Namespace("default")
 
@@ -128,17 +133,19 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 // encounters them while grouping chunks by BlobID.
 func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 	dataDir := t.TempDir()
+	ctx := context.Background()
 
 	s1, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	if err := s1.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	ns1 := s1.Namespace("default")
-	ctx := context.Background()
 
 	if _, err := ns1.Put(ctx, "keep", bytes.NewReader([]byte("survives")), store.PutOptions{}); err != nil {
 		t.Fatalf("Put(keep): %v", err)
@@ -163,12 +170,14 @@ func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 	}
 
 	s2, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open (fresh index): %v", err)
+	}
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns2 := s2.Namespace("default")
 

@@ -21,7 +21,7 @@ import (
 
 func TestSecurity_VULN9_EmptyKeyRejectedByPut(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	_, err := ns.Put(ctx, "", bytes.NewReader([]byte("data")), store.PutOptions{})
@@ -36,7 +36,7 @@ func TestSecurity_VULN9_EmptyKeyRejectedByPut(t *testing.T) {
 
 func TestSecurity_VULN9_EmptyKeyRejectedByGet(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	_, err := ns.Get(ctx, "")
@@ -51,7 +51,7 @@ func TestSecurity_VULN9_EmptyKeyRejectedByGet(t *testing.T) {
 
 func TestSecurity_VULN9_EmptyKeyRejectedByHead(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	_, err := ns.Head(ctx, "")
@@ -66,7 +66,7 @@ func TestSecurity_VULN9_EmptyKeyRejectedByHead(t *testing.T) {
 
 func TestSecurity_VULN9_EmptyKeyRejectedByDelete(t *testing.T) {
 	s := openStore(t)
-	ns := s.Namespace(object.DefaultNamespaceID)
+	ns := s.Namespace("default")
 	ctx := context.Background()
 
 	// Delete is idempotent for missing keys, but empty key is invalid input.
@@ -285,18 +285,20 @@ func TestSecurity_VULN4_PaddingBytesAreZero(t *testing.T) {
 	// If the zeroing is ever removed, stale pool data from a previous write
 	// (potentially another tenant's payload) would appear in the padding.
 	dir := t.TempDir()
+	ctx := context.Background()
 	s, err := store.Open(store.Config{
-		DataDir:          dir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
-		PageSize:         4096, // small page to make padding region large
+		DataDir:  dir,
+		Index:    index.NewMemoryBackend(),
+		PageSize: 4096, // small page to make padding region large
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatal(err)
+	}
 
-	ns := s.Namespace(object.DefaultNamespaceID)
-	ctx := context.Background()
+	ns := s.Namespace("default")
 
 	// Fill the pool with a distinctive pattern by writing once first.
 	payload1 := bytes.Repeat([]byte{0xFF}, 512) // 512 bytes of 0xFF
@@ -317,21 +319,24 @@ func TestSecurity_VULN4_PaddingBytesAreZero(t *testing.T) {
 	// if padding bytes corrupted adjacent data), and we trust the clear()
 	// call. A direct test would require access to the raw segment bytes.
 	s2, err := store.Open(store.Config{
-		DataDir:          dir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
 
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatal(err)
+	}
+
 	// If padding leaked 0xFF into the page, the CRC stored in the header
 	// covers only the payload — so CRC would still pass. But a future
 	// Verify() or scan would misinterpret padding bytes as the start of the
 	// next page header (magic check would fail). We test that RebuildIndex
 	// completes without error, which requires clean page boundaries.
-	if err := s2.Namespace(object.DefaultNamespaceID).RebuildIndex(ctx); err != nil {
+	if err := s2.Namespace("default").RebuildIndex(ctx); err != nil {
 		t.Errorf("RebuildIndex failed — corrupt page boundaries (possible padding leak): %v", err)
 	}
 }

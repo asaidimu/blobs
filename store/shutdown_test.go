@@ -10,18 +10,22 @@ import (
 
 	bserrors "github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 )
 
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	ctx := context.Background()
 	s, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: t.TempDir(),
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
+	}
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
 	}
 	return s
 }
@@ -312,10 +316,9 @@ func TestOperationsRejectedAfterClose(t *testing.T) {
 // write time.
 func TestConfigValidation_RejectsNonsensicalPageSize(t *testing.T) {
 	_, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
-		PageSize:         50, // < pageHeaderSize (88)
+		DataDir:  t.TempDir(),
+		Index:    index.NewMemoryBackend(),
+		PageSize: 50, // < pageHeaderSize (88)
 	})
 	if err == nil {
 		t.Fatal("store.Open with PageSize=50 = nil error, want a validation error")
@@ -324,9 +327,8 @@ func TestConfigValidation_RejectsNonsensicalPageSize(t *testing.T) {
 
 func TestConfigValidation_AcceptsZeroValues(t *testing.T) {
 	s, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: t.TempDir(),
+		Index:   index.NewMemoryBackend(),
 		// PageSize, ChunkSize, MaxSegmentSize all left at zero.
 	})
 	if err != nil {
@@ -337,11 +339,10 @@ func TestConfigValidation_AcceptsZeroValues(t *testing.T) {
 
 func TestConfigValidation_RejectsInconsistentChunkAndSegmentSize(t *testing.T) {
 	_, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
-		ChunkSize:        10 * 1024 * 1024,
-		MaxSegmentSize:   1024 * 1024, // smaller than ChunkSize
+		DataDir:        t.TempDir(),
+		Index:          index.NewMemoryBackend(),
+		ChunkSize:      10 * 1024 * 1024,
+		MaxSegmentSize: 1024 * 1024, // smaller than ChunkSize
 	})
 	if err == nil {
 		t.Fatal("store.Open with ChunkSize > MaxSegmentSize = nil error, want a validation error")

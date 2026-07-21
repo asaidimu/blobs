@@ -75,8 +75,6 @@ indefinitely.
 
 All options are validated eagerly at `Open` — a bad config fails before any disk I/O.
 
-A `"default"` namespace is created automatically on first open.
-
 ---
 
 ## Namespaces
@@ -95,12 +93,12 @@ nsList, _ := s.ListNamespaces(ctx)
 // Get a scoped handle (cheap — no I/O).
 ns := s.Namespace("my-app")
 
-// Delete a namespace and all its refs (default cannot be deleted).
+// Delete a namespace and all its refs.
 s.DeleteNamespace(ctx, "my-app")
 ```
 
 Namespace IDs must match `^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$` (2–63 chars,
-lowercase alphanumeric plus hyphens). `"default"` is reserved.
+lowercase alphanumeric plus hyphens).
 
 ---
 
@@ -338,6 +336,7 @@ reopens it to prove data survives a restart.
 ```go
 import (
     "github.com/asaidimu/blobs/index/backend"
+    "github.com/asaidimu/blobs/object"
     "github.com/asaidimu/blobs/store"
 )
 
@@ -345,7 +344,8 @@ idx, _ := backend.Open(backend.Options{Path: "index.bbolt"})
 s, _     := store.Open(store.Config{DataDir: "data", Index: idx})
 defer s.Close()
 
-ns := s.Namespace("default")
+s.CreateNamespace(ctx, object.Namespace{ID: "my-app"})
+ns := s.Namespace("my-app")
 ns.Put(ctx, "key", reader, store.PutOptions{})
 rc, _      := ns.Get(ctx, "key")
 items, _   := ns.List(ctx, store.ListOptions{})

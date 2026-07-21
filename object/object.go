@@ -64,17 +64,10 @@ type SegmentID uint64
 
 func (id SegmentID) String() string { return fmt.Sprintf("%016x", uint64(id)) }
 
-// NamespaceID is a validated, URL-safe namespace identifier.
-// The special value "default" is always present in a store.
-const DefaultNamespaceID = "default"
-
 var nsIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$`)
 
 // ValidateNamespaceID returns an error if id is not a valid namespace identifier.
 func ValidateNamespaceID(id string) error {
-	if id == DefaultNamespaceID {
-		return nil
-	}
 	if !nsIDPattern.MatchString(id) {
 		return fmt.Errorf(
 			"invalid namespace id %q: must be lowercase alphanumeric + hyphens, 2–63 chars",

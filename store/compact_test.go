@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 )
 
@@ -21,17 +22,20 @@ func openCompactTestStore(t *testing.T) *store.Store {
 	const pageSize = 4 * 1024
 	const segHeaderSize = 128
 	s, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
-		PageSize:         pageSize,
-		ChunkSize:        1024,
-		MaxSegmentSize:   segHeaderSize + 2*pageSize, // exactly two chunks per segment
+		DataDir:        t.TempDir(),
+		Index:          index.NewMemoryBackend(),
+		PageSize:       pageSize,
+		ChunkSize:      1024,
+		MaxSegmentSize: segHeaderSize + 2*pageSize, // exactly two chunks per segment
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	return s
 }
 

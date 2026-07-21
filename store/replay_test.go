@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/store"
 	"github.com/asaidimu/blobs/volume"
 )
@@ -46,19 +47,21 @@ func TestWALReplay_RegistersInterruptedWriteAsNonReapable(t *testing.T) {
 
 	// Step 2: "restart" — open a real Store pointed at the same DataDir,
 	// with a fresh, empty index (nothing has ever been committed to any
-	// index for this data — that's the whole point). store.Open's
-	// openEngine call replays the WAL as part of coming online.
+	// index for this data — that's the whole point). CreateNamespace opens
+	// the engine and replays the WAL as part of coming online.
 	s, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open (post-crash restart): %v", err)
 	}
 	defer s.Close()
-	ns := s.Namespace(nsID)
 	ctx := context.Background()
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: nsID}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
+	ns := s.Namespace(nsID)
 
 	// The blob was never linked to any key — that mapping only ever
 	// lived in a CommitPut call that never happened, and nothing durable
@@ -90,17 +93,19 @@ func TestWALReplay_RegistersInterruptedWriteAsNonReapable(t *testing.T) {
 // closed. This is what should happen on every normal restart.
 func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 	dataDir := t.TempDir()
+	ctx := context.Background()
 
 	s1, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
+	if err := s1.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	ns1 := s1.Namespace("default")
-	ctx := context.Background()
 
 	if _, err := ns1.Put(ctx, "normal", bytes.NewReader([]byte("a completely normal, fully committed write")), store.PutOptions{}); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -117,14 +122,16 @@ func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 	// replay's job), while replay itself must not treat this already-
 	// complete write as something to touch, and must not error out.
 	s2, err := store.Open(store.Config{
-		DataDir:          dataDir,
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: dataDir,
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open (fresh index): %v", err)
 	}
 	defer s2.Close()
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 	ns2 := s2.Namespace("default")
 
 	if _, err := ns2.Head(ctx, "normal"); err == nil {
@@ -153,13 +160,16 @@ func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 // namespace, or a store that was always empty) doesn't error and doesn't
 // try to read WAL files that don't exist.
 func TestWALReplay_EmptyNamespaceIsFastAndHarmless(t *testing.T) {
+	ctx := context.Background()
 	s, err := store.Open(store.Config{
-		DataDir:          t.TempDir(),
-		Index:            index.NewMemoryBackend(),
-		DefaultNamespace: "default",
+		DataDir: t.TempDir(),
+		Index:   index.NewMemoryBackend(),
 	})
 	if err != nil {
 		t.Fatalf("store.Open on a brand new DataDir: %v", err)
 	}
 	defer s.Close()
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
 }

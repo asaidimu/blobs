@@ -15,7 +15,8 @@
 //	    Index:   index.NewMemoryBackend(), // swap for bbolt, badger, etc.
 //	})
 //
-//	ns := s.Namespace("default")
+//	s.CreateNamespace(ctx, object.Namespace{ID: "my-app"})
+//	ns := s.Namespace("my-app")
 //	info, err := ns.Put(ctx, "my-file.jpg", r, store.PutOptions{ContentType: "image/jpeg"})
 //	rc, err := ns.Get(ctx, "my-file.jpg")
 //	err = ns.Delete(ctx, "my-file.jpg")
@@ -50,11 +51,6 @@ type Config struct {
 	// Store.Close will call Index.Close().
 	// Use index.NewMemoryBackend() for tests.
 	Index index.Backend
-
-	// DefaultNamespace, if non-empty, is auto-created on Open.
-	// When empty (the zero value), no namespace is created implicitly.
-	// Set to "default" to restore the original behavior.
-	DefaultNamespace string
 
 	// Volume tuning — zero values use package defaults (16 KB page, 4 MB
 	// chunk, 512 MB segment).
@@ -114,8 +110,6 @@ type Store struct {
 }
 
 // Open opens an existing store or creates a new one.
-// If Config.DefaultNamespace is non-empty, that namespace is
-// automatically created if it does not already exist.
 func Open(cfg Config) (*Store, error) {
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("store: Config.DataDir must not be empty")
@@ -139,22 +133,6 @@ func Open(cfg Config) (*Store, error) {
 	}
 
 	ctx := context.Background()
-
-	if cfg.DefaultNamespace != "" {
-		nsID := cfg.DefaultNamespace
-		if _, err := s.idx.GetNamespace(ctx, nsID); err != nil {
-			if !index.IsNotFound(err) {
-				return nil, fmt.Errorf("store: check default namespace: %w", err)
-			}
-			if err := s.idx.PutNamespace(ctx, object.Namespace{
-				ID:          nsID,
-				DisplayName: "Default",
-				CreatedAt:   time.Now().UTC(),
-			}); err != nil {
-				return nil, fmt.Errorf("store: create default namespace: %w", err)
-			}
-		}
-	}
 
 	// Open volume engines for all known namespaces.
 	namespaces, err := s.idx.ListNamespaces(ctx)
@@ -258,13 +236,8 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]object.Namespace, error) 
 }
 
 // DeleteNamespace removes a namespace and all its refs.
-// The default namespace cannot be deleted.
 // Physical bytes are not reclaimed until GC/compaction runs on the engine.
 func (s *Store) DeleteNamespace(ctx context.Context, nsID string) error {
-	if nsID == object.DefaultNamespaceID {
-		return fmt.Errorf("store: cannot delete the default namespace")
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
