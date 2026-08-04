@@ -107,6 +107,16 @@ type Store struct {
 	// Using a per-namespace mutex (not the global store mutex) avoids
 	// blocking Puts across different namespaces.
 	quotaMu sync.Map
+
+	// nsRW provides per-namespace read-write mutual exclusion between
+	// ordinary volume-engine operations (Put, Get, Verify, RebuildIndex,
+	// Compact phase 1 — all taken as shared read guards) and Compact
+	// phase 2's segment rewrite (taken as an exclusive write guard) for
+	// that same namespace. sync.Map stores *sync.RWMutex keyed by
+	// namespace ID. This is what lets a segment rewrite on namespace A
+	// block only namespace A's own operations instead of the whole
+	// store — see beginNSOp and beginExclusiveNSOp.
+	nsRW sync.Map
 }
 
 // Open opens an existing store or creates a new one.
@@ -407,6 +417,14 @@ func (s *Store) nsMutex(nsID string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
+// nsRWMutex returns the per-namespace read-write mutex used to scope
+// Compact phase 2's exclusivity to a single namespace. Creates one on
+// first use. Never deleted, for the same reason nsMutex isn't.
+func (s *Store) nsRWMutex(nsID string) *sync.RWMutex {
+	v, _ := s.nsRW.LoadOrStore(nsID, &sync.RWMutex{})
+	return v.(*sync.RWMutex)
+}
+
 // beginOp acquires a read guard on the store for an operation that
 // touches the index but not a specific volume engine. It returns
 // *errors.ClosedError if the store is already closed. On success, the
@@ -430,10 +448,21 @@ func (s *Store) endOp() {
 }
 
 // beginNSOp is beginOp plus a namespace engine lookup, for operations that
-// touch a volume engine directly (Put, Get, Verify, RebuildIndex,
-// Compact). On success the read guard is held and the caller must call
-// endOp when done; on error no guard is held and endOp must not be
-// called.
+// touch a volume engine directly (Put, Get, Verify, RebuildIndex, and
+// Compact's phase 1). On success it holds TWO guards: the store's shared
+// read guard (from beginOp) and this namespace's shared read guard. The
+// second is what scopes Compact phase 2's exclusivity (see
+// beginExclusiveNSOp) to a single namespace: a rewrite running for
+// namespace A takes namespace A's write guard, which blocks new
+// beginNSOp calls for namespace A, but has no effect whatsoever on
+// namespace B's RWMutex — so namespace B's Puts, Gets, and everything
+// else proceed exactly as if nothing were happening.
+//
+// On success the caller MUST call endNSOp(nsID) exactly once when the
+// operation is entirely done — for Get, which hands back a long-lived
+// reader, that means when the reader itself is Closed, not when Get
+// returns (same rule beginOp/endOp already follow; see Close's doc
+// comment). On error, no guard is held and endNSOp must not be called.
 func (s *Store) beginNSOp(nsID string) (*volume.Engine, error) {
 	if err := s.beginOp(); err != nil {
 		return nil, err
@@ -443,46 +472,54 @@ func (s *Store) beginNSOp(nsID string) (*volume.Engine, error) {
 		s.endOp()
 		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
 	}
+	s.nsRWMutex(nsID).RLock()
 	return eng, nil
 }
 
-// beginExclusiveOp acquires the store's write lock — the same lock Close
-// takes — for an operation that must run with nothing else touching the
-// store concurrently. Unlike beginOp/beginNSOp, which allow any number of
-// concurrent readers, this blocks every other operation, on every
-// namespace, until endExclusiveOp is called. That's a real throughput
-// cost, so it is used sparingly: today, only by Compact's phase 2 segment
-// rewrite, which physically relocates live chunks' bytes and therefore
-// must not run while a Get elsewhere might still be reading from the old
-// location (see beginOp's doc comment on why a Get's guard outlives the
-// Get call itself — this is what makes that guarantee airtight here too).
-// It returns *errors.ClosedError if the store is already closed.
-func (s *Store) beginExclusiveOp() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return &bserrors.ClosedError{}
-	}
-	return nil
+// endNSOp releases both guards a successful beginNSOp call for nsID
+// acquired.
+func (s *Store) endNSOp(nsID string) {
+	s.nsRWMutex(nsID).RUnlock()
+	s.endOp()
 }
 
-// endExclusiveOp releases the guard acquired by beginExclusiveOp or
-// beginExclusiveNSOp.
-func (s *Store) endExclusiveOp() {
-	s.mu.Unlock()
-}
-
-// beginExclusiveNSOp is beginExclusiveOp plus a namespace engine lookup.
+// beginExclusiveNSOp acquires the store's shared read guard — the same
+// one beginNSOp takes, so this still counts as "an operation in flight"
+// for Close's drain to wait on — plus this namespace's WRITE guard,
+// giving exclusive access to nsID's volume engine without affecting any
+// other namespace at all.
+//
+// This is what lets Compact's phase 2 physically relocate live chunks'
+// bytes safely: it blocks new beginNSOp calls for the SAME namespace (so
+// no Get elsewhere can resolve to a location this rewrite is about to
+// invalidate), while every other namespace's Puts, Gets, and everything
+// else proceeds untouched for the full duration of the rewrite, since
+// they contend on a completely different namespace's RWMutex. Prior to
+// this, exclusivity was store-wide (via the store's own write lock),
+// meaning a segment rewrite on one namespace froze every namespace —
+// that store-wide throughput cost is what this narrows away.
+//
+// It returns *errors.ClosedError if the store is already closed, or
+// *errors.NotFoundError if nsID does not exist. On success the caller
+// MUST call endExclusiveNSOp(nsID) exactly once when done.
 func (s *Store) beginExclusiveNSOp(nsID string) (*volume.Engine, error) {
-	if err := s.beginExclusiveOp(); err != nil {
+	if err := s.beginOp(); err != nil {
 		return nil, err
 	}
 	eng, ok := s.engines[nsID]
 	if !ok {
-		s.endExclusiveOp()
+		s.endOp()
 		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
 	}
+	s.nsRWMutex(nsID).Lock()
 	return eng, nil
+}
+
+// endExclusiveNSOp releases both guards a successful beginExclusiveNSOp
+// call for nsID acquired.
+func (s *Store) endExclusiveNSOp(nsID string) {
+	s.nsRWMutex(nsID).Unlock()
+	s.endOp()
 }
 
 // ── NamespaceHandle ───────────────────────────────────────────────────────────
@@ -511,7 +548,7 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 	if err != nil {
 		return nil, err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(h.nsID)
 
 	// Content-type detection reads from r before WriteBlob does, and that
 	// read can block on slow caller I/O exactly like WriteBlob's own reads
@@ -589,6 +626,36 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 // The caller must close the returned ReadCloser when done.
 // Returns *errors.NotFoundError if key does not exist.
 func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	return h.getChunkReader(ctx, key)
+}
+
+// GetSeekable is Get, but returns a reader that additionally implements
+// io.Seeker — suitable for handing directly to http.ServeContent (see the
+// streaming package), which already implements the full HTTP Range,
+// conditional-GET, and multi-range-request protocol against any
+// io.ReadSeeker. This package doesn't need to know anything about the
+// Range header to serve blobs efficiently; the standard library already
+// does, correctly, given a seekable reader.
+//
+// Seeking to any offset is efficient regardless of target: chunk
+// boundaries and lengths are already known from the blob's manifest, so
+// no chunk before the seek target is ever read from disk (see
+// chunkReader.Seek).
+//
+// The caller must close the returned ReadSeekCloser when done. Returns
+// *errors.NotFoundError if key does not exist.
+func (h *NamespaceHandle) GetSeekable(ctx context.Context, key string) (io.ReadSeekCloser, error) {
+	return h.getChunkReader(ctx, key)
+}
+
+// getChunkReader is the shared implementation behind Get and
+// GetSeekable — both hand back the exact same underlying *chunkReader,
+// which always implements io.Seeker regardless of which method returns
+// it. The two public methods differ only in which interface they expose
+// it as: Get's narrower io.ReadCloser signals "you probably just want to
+// stream this end to end," GetSeekable's wider io.ReadSeekCloser signals
+// "this supports random access."
+func (h *NamespaceHandle) getChunkReader(ctx context.Context, key string) (*chunkReader, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
@@ -598,16 +665,16 @@ func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, e
 		return nil, err
 	}
 	// Ownership of the store's read guard transfers to the returned
-	// chunkReader on success: Get itself returns quickly, but the actual
-	// chunk reads happen later, via chunkReader.Read, well after this call
-	// has returned. The guard must stay held for that whole lifetime so
+	// chunkReader on success: this method returns quickly, but the actual
+	// chunk reads happen later, via chunkReader.Read/Seek, well after this
+	// call has returned. The guard must stay held for that whole lifetime so
 	// Store.Close cannot close this engine out from under an in-flight
 	// read — so it is released here only on the error paths below; on the
 	// success path, chunkReader.Close releases it exactly once instead.
 	guardTransferred := false
 	defer func() {
 		if !guardTransferred {
-			h.store.endOp()
+			h.store.endNSOp(h.nsID)
 		}
 	}()
 
@@ -632,7 +699,7 @@ func (h *NamespaceHandle) Get(ctx context.Context, key string) (io.ReadCloser, e
 	}
 
 	guardTransferred = true
-	return newChunkReader(eng, locations, h.store.endOp), nil
+	return newChunkReader(eng, locations, func() { h.store.endNSOp(h.nsID) }), nil
 }
 
 // Head returns metadata for key without reading any blob data.
@@ -765,7 +832,7 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(h.nsID)
 
 	refs, err := h.store.idx.ListRefs(ctx, h.nsID, "")
 	if err != nil {
@@ -840,7 +907,7 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(h.nsID)
 
 	type blobAccum struct {
 		chunkIDs    map[int]object.ChunkID // by Seq, so out-of-order page scans still assemble correctly
@@ -945,12 +1012,15 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 //     its live chunks copied into a fresh segment, the index updated to
 //     point at the new locations, and the old segment's files removed.
 //     This DOES relocate live chunks' physical bytes, so it runs under
-//     the store's exclusive guard (see beginExclusiveNSOp): it will not
-//     start while a Get elsewhere has an open reader that might still
+//     this namespace's exclusive guard (see beginExclusiveNSOp): it will
+//     not start while a Get elsewhere has an open reader that might still
 //     resolve to the segment being rewritten, and nothing new can start
-//     until it finishes. This is the same store-wide tradeoff
-//     CreateNamespace/DeleteNamespace already make — Compact is a
-//     deliberate, occasional maintenance operation, not a hot path.
+//     on THIS namespace until it finishes. That exclusivity is scoped to
+//     this namespace's own RWMutex, not the whole store — Puts, Gets, and
+//     everything else on every other namespace proceed untouched for the
+//     full duration of the rewrite. Compact is still a deliberate,
+//     occasional maintenance operation rather than a hot path, but it no
+//     longer needs to be scheduled around unrelated namespaces' traffic.
 //
 // If phase 1 fails, phase 2 does not run and the phase 1 error is
 // returned. If phase 1 succeeds but phase 2 fails, the phase 1 results
@@ -987,7 +1057,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	if err != nil {
 		return CompactResult{}, err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(h.nsID)
 
 	// Collect all chunk entries that belong to blobs with RefCount == 0.
 	// We scan segment files (the ground truth) and cross-reference the index.
@@ -1062,7 +1132,7 @@ func (h *NamespaceHandle) compactPhase2(ctx context.Context, threshold float64) 
 	if err != nil {
 		return 0, 0, err
 	}
-	defer h.store.endExclusiveOp()
+	defer h.store.endExclusiveNSOp(h.nsID)
 
 	stats, err := eng.SegmentStats()
 	if err != nil {
@@ -1228,26 +1298,35 @@ func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) er
 
 // ── chunkReader — streaming reassembly ───────────────────────────────────────
 
-// chunkReader implements io.ReadCloser by reading chunks from the volume engine
-// in order, buffering one chunk at a time.
+// chunkReader implements io.ReadCloser (and, additionally, io.Seeker — see
+// Seek below) by reading chunks from the volume engine in order, buffering
+// one chunk at a time.
 //
-// It also carries ownership of the Store's read guard that NamespaceHandle.Get
-// acquired: release is called exactly once, when Close is called, so the
-// guard stays held for as long as the caller might still call Read — not
-// just for the duration of the Get call that created this reader. See
-// Store.Close's doc comment.
+// It also carries ownership of the Store's read guard that
+// NamespaceHandle.Get/GetSeekable acquired: release is called exactly
+// once, when Close is called, so the guard stays held for as long as the
+// caller might still call Read or Seek — not just for the duration of the
+// Get/GetSeekable call that created this reader. See Store.Close's doc
+// comment.
 type chunkReader struct {
-	engine    *volume.Engine
-	locations []object.ChunkEntry
-	idx       int    // next chunk to load
-	buf       []byte // current chunk payload
-	pos       int    // read position within buf
-	release   func()
-	closeOnce sync.Once
+	engine      *volume.Engine
+	locations   []object.ChunkEntry
+	totalSize   int64 // sum of every location's Length, computed once at construction
+	idx         int   // next chunk to load
+	pendingSkip int64 // bytes to discard from the next-loaded chunk; set by Seek, consumed once
+	buf         []byte // current chunk payload
+	pos         int    // read position within buf
+	absPos      int64  // absolute stream position, for Seek's SeekCurrent/SeekEnd math
+	release     func()
+	closeOnce   sync.Once
 }
 
 func newChunkReader(eng *volume.Engine, locations []object.ChunkEntry, release func()) *chunkReader {
-	return &chunkReader{engine: eng, locations: locations, release: release}
+	var total int64
+	for _, loc := range locations {
+		total += loc.Length
+	}
+	return &chunkReader{engine: eng, locations: locations, totalSize: total, release: release}
 }
 
 func (r *chunkReader) Read(p []byte) (int, error) {
@@ -1256,6 +1335,7 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 		if r.pos < len(r.buf) {
 			n := copy(p, r.buf[r.pos:])
 			r.pos += n
+			r.absPos += int64(n)
 			return n, nil
 		}
 
@@ -1267,15 +1347,85 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		r.idx++
+		if r.pendingSkip > 0 {
+			// Left over from a Seek that landed partway into this chunk:
+			// discard the leading bytes before this chunk's data is
+			// served — resolveChunkOffset guarantees pendingSkip is
+			// strictly less than this chunk's length, so this always
+			// fully consumes it in one step.
+			skip := r.pendingSkip
+			if skip > int64(len(data)) {
+				skip = int64(len(data)) // defensive; should not happen
+			}
+			data = data[skip:]
+			r.pendingSkip -= skip
+		}
 		r.buf = data
 		r.pos = 0
-		r.idx++
 	}
+}
+
+// Seek implements io.Seeker, which is what lets a chunkReader be handed
+// directly to http.ServeContent (see the streaming package) to get full
+// HTTP Range / conditional-GET / multi-range-request support for free
+// from the standard library, without this package needing to know
+// anything about the HTTP Range protocol itself.
+//
+// whence follows the usual io.SeekStart / io.SeekCurrent / io.SeekEnd
+// convention. Seeking to any offset is efficient regardless of target:
+// chunk boundaries and lengths are already known from the blob's
+// manifest (resolveChunkOffset works purely against metadata already
+// held in r.locations), so no chunk before the target is ever read from
+// disk — the currently buffered chunk, if any, is simply discarded, and
+// the next Read call loads whichever chunk the target actually falls in.
+func (r *chunkReader) Seek(offset int64, whence int) (int64, error) {
+	var target int64
+	switch whence {
+	case io.SeekStart:
+		target = offset
+	case io.SeekCurrent:
+		target = r.absPos + offset
+	case io.SeekEnd:
+		target = r.totalSize + offset
+	default:
+		return 0, fmt.Errorf("store: chunkReader.Seek: invalid whence %d", whence)
+	}
+	if target < 0 {
+		return 0, fmt.Errorf("store: chunkReader.Seek: resulting offset must not be negative")
+	}
+
+	idx, intraOffset := resolveChunkOffset(r.locations, target)
+	r.idx = idx
+	r.pendingSkip = intraOffset
+	r.buf = nil
+	r.pos = 0
+	r.absPos = target
+	return target, nil
+}
+
+// resolveChunkOffset finds which chunk (by index into locations) contains
+// byte offset, and the intra-chunk offset within that chunk's payload
+// corresponding to offset. locations must be in blob order. An offset
+// equal to the sum of every chunk's length (i.e. exactly at EOF) resolves
+// to len(locations), 0 — meaning "no chunk left to read, already at the
+// end," which Read already treats as io.EOF via its idx bounds check.
+func resolveChunkOffset(locations []object.ChunkEntry, offset int64) (chunkIdx int, intraOffset int64) {
+	var cumulative int64
+	for i, loc := range locations {
+		next := cumulative + loc.Length
+		if offset < next {
+			return i, offset - cumulative
+		}
+		cumulative = next
+	}
+	return len(locations), 0
 }
 
 func (r *chunkReader) Close() error {
 	r.buf = nil
 	r.idx = len(r.locations)
+	r.pendingSkip = 0
 	if r.release != nil {
 		r.closeOnce.Do(r.release)
 	}
