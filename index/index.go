@@ -47,6 +47,21 @@ type Tx interface {
 	Delete(key []byte) error
 }
 
+// BatchGetter is an optional capability a Backend may implement for more
+// efficient multi-key reads — resolving many keys within a single
+// read-only transaction instead of issuing one Get (and one transaction
+// acquisition) per key. A Backend that doesn't implement this still
+// works correctly everywhere it's used: callers fall back to individual
+// Get calls, just without the batching benefit.
+type BatchGetter interface {
+	// GetMulti returns one value per key, in the same order as keys. A
+	// missing key's slot must be nil — GetMulti reports absence
+	// positionally rather than failing the whole batch, since a batch of
+	// otherwise-valid lookups shouldn't error out entirely just because
+	// one entry happens to already be gone.
+	GetMulti(ctx context.Context, keys [][]byte) ([][]byte, error)
+}
+
 // ── Key constructors ──────────────────────────────────────────────────────────
 
 func keyNS(nsID string) []byte          { return []byte("ns:" + nsID) }
@@ -212,6 +227,56 @@ func (idx *Index) GetChunk(ctx context.Context, id object.ChunkID) (*object.Chun
 	}
 	var chunk object.ChunkEntry
 	return &chunk, unmarshal(v, &chunk)
+}
+
+// GetChunks resolves multiple chunk IDs at once, returning entries in the
+// same order as ids. If the backend implements BatchGetter, this issues a
+// single batched read instead of len(ids) separate Get calls — for a
+// backend like the bbolt one, that collapses len(ids) separate read
+// transactions into one, which matters a lot for a blob with hundreds of
+// chunks (e.g. resolving every chunk location needed to stream or verify
+// a multi-gigabyte blob). Backends without BatchGetter fall back to
+// calling GetChunk in a loop, with identical behavior to before this
+// method existed.
+//
+// Returns *errors.NotFoundError, identifying the specific missing chunk
+// ID in its error message, if any id in ids has no index entry.
+func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object.ChunkEntry, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	bg, ok := idx.b.(BatchGetter)
+	if !ok {
+		chunks := make([]object.ChunkEntry, len(ids))
+		for i, id := range ids {
+			chunk, err := idx.GetChunk(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			chunks[i] = *chunk
+		}
+		return chunks, nil
+	}
+
+	keys := make([][]byte, len(ids))
+	for i, id := range ids {
+		keys[i] = keyChunk(id)
+	}
+	raws, err := bg.GetMulti(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	chunks := make([]object.ChunkEntry, len(ids))
+	for i, raw := range raws {
+		if raw == nil {
+			return nil, fmt.Errorf("index: get chunk %s: %w", ids[i], &errors.NotFoundError{})
+		}
+		if err := unmarshal(raw, &chunks[i]); err != nil {
+			return nil, err
+		}
+	}
+	return chunks, nil
 }
 
 func (idx *Index) DeleteChunk(ctx context.Context, id object.ChunkID) error {
@@ -565,6 +630,28 @@ func (m *MemoryBackend) Delete(_ context.Context, key []byte) error {
 	}
 	delete(m.data, string(key))
 	return nil
+}
+
+// GetMulti implements BatchGetter: a single RLock covers every key
+// instead of one RLock per key, matching the guarantee MemoryBackend's
+// individual Get already makes (a defensive copy per returned value).
+func (m *MemoryBackend) GetMulti(_ context.Context, keys [][]byte) ([][]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, &errors.ClosedError{}
+	}
+	out := make([][]byte, len(keys))
+	for i, k := range keys {
+		v, ok := m.data[string(k)]
+		if !ok {
+			continue // leave out[i] nil, per BatchGetter's contract
+		}
+		dst := make([]byte, len(v))
+		copy(dst, v)
+		out[i] = dst
+	}
+	return out, nil
 }
 
 func (m *MemoryBackend) Scan(_ context.Context, prefix []byte, fn func(k, v []byte) error) error {

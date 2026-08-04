@@ -202,6 +202,42 @@ func (b *BboltBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
 	return out, nil
 }
 
+// GetMulti implements index.BatchGetter: it resolves every key within a
+// single bbolt read transaction instead of calling Get (and opening a
+// fresh db.View transaction) once per key. For a caller resolving many
+// chunk locations at once — e.g. every chunk of a multi-gigabyte streamed
+// or verified blob, which can easily be a few hundred entries — this
+// turns a few hundred transaction acquisitions into exactly one.
+//
+// A missing key's slot in the result is nil, matching index.BatchGetter's
+// contract exactly; unlike Get, this never returns *errors.NotFoundError
+// itself — callers that need "found vs missing" per key check for a nil
+// slot instead.
+func (b *BboltBackend) GetMulti(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make([][]byte, len(keys))
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		bkt, err := b.getBucket(tx)
+		if err != nil {
+			return err
+		}
+		for i, k := range keys {
+			v := bkt.Get(k)
+			if v == nil {
+				continue // leave out[i] nil, per BatchGetter's contract
+			}
+			out[i] = append([]byte(nil), v...)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("backends: bbolt: get multi: %w", err)
+	}
+	return out, nil
+}
+
 // Delete implements index.Backend. Deleting an absent key is not an error,
 // matching index.MemoryBackend's behavior.
 func (b *BboltBackend) Delete(ctx context.Context, key []byte) error {
