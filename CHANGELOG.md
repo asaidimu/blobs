@@ -1,3 +1,15 @@
+## [1.2.2](https://github.com/asaidimu/blobs/compare/v1.2.1...v1.2.2) (2026-08-04)
+
+
+### Bug Fixes
+
+* **store:** scope Compact phase 2 exclusivity to a single namespace ([ea15a9d](https://github.com/asaidimu/blobs/commit/ea15a9dcf67571f782eb586461706186d5be7f0e))
+
+
+### Performance Improvements
+
+* **index,store:** batch chunk lookups, cache blob lookups in compactPhase1 ([485c806](https://github.com/asaidimu/blobs/commit/485c80675906c6fe0a7caa2b0cbf1bd9c2e938c4))
+
 ## [1.2.1](https://github.com/asaidimu/blobs/compare/v1.2.0...v1.2.1) (2026-07-21)
 
 
