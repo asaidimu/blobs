@@ -689,13 +689,15 @@ func (h *NamespaceHandle) getChunkReader(ctx context.Context, key string) (*chun
 	}
 
 	// Resolve chunk locations eagerly so the reader is self-contained.
-	locations := make([]object.ChunkEntry, len(blob.ChunkIDs))
-	for i, cid := range blob.ChunkIDs {
-		loc, err := h.store.idx.GetChunk(ctx, cid)
-		if err != nil {
-			return nil, fmt.Errorf("store: get chunk location for %s: %w", cid, err)
-		}
-		locations[i] = *loc
+	// GetChunks batches this into a single index round trip when the
+	// backend supports it, instead of one Get per chunk — for a
+	// multi-gigabyte blob with hundreds of chunks (exactly the case a
+	// streamed Get/GetSeekable needs to resolve before any byte can be
+	// served), that's the difference between one transaction and
+	// hundreds.
+	locations, err := h.store.idx.GetChunks(ctx, blob.ChunkIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: get chunk locations: %w", err)
 	}
 
 	guardTransferred = true
@@ -850,13 +852,14 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 				ref.BlobID, ref.Key, err)
 		}
 
-		for _, cid := range blob.ChunkIDs {
-			loc, err := h.store.idx.GetChunk(ctx, cid)
-			if err != nil {
-				return fmt.Errorf("store: verify: missing location for chunk %s: %w", cid, err)
-			}
+		locations, err := h.store.idx.GetChunks(ctx, blob.ChunkIDs)
+		if err != nil {
+			return fmt.Errorf("store: verify: missing location for a chunk of blob %s (key %q): %w",
+				ref.BlobID, ref.Key, err)
+		}
+		for _, loc := range locations {
 			// ReadChunk performs CRC verification internally.
-			if _, err := eng.ReadChunk(*loc); err != nil {
+			if _, err := eng.ReadChunk(loc); err != nil {
 				return err
 			}
 		}
@@ -1068,6 +1071,31 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		chunksFreed int64
 	)
 
+	// blobCache avoids re-fetching the same blob manifest from the index
+	// once per chunk: ScanSegments visits every chunk of every blob, so
+	// without this, a blob with N chunks triggers N identical idx.GetBlob
+	// calls for the exact same record — for a large chunked file (a
+	// multi-gigabyte blob split into hundreds of chunks), that's hundreds
+	// of redundant index round trips to answer a question ("is this blob
+	// dead?") whose answer doesn't change chunk to chunk. A nil cached
+	// entry marks a BlobID we've already confirmed is missing from the
+	// index, so an orphaned chunk's every other chunk doesn't re-attempt
+	// — and re-fail — the same lookup either.
+	blobCache := make(map[object.BlobID]*object.BlobEntry)
+
+	lookupBlob := func(id object.BlobID) (*object.BlobEntry, bool) {
+		if blob, cached := blobCache[id]; cached {
+			return blob, blob != nil
+		}
+		blob, err := h.store.idx.GetBlob(ctx, id)
+		if err != nil {
+			blobCache[id] = nil
+			return nil, false
+		}
+		blobCache[id] = blob
+		return blob, true
+	}
+
 	if err := eng.ScanSegments(func(entry object.ChunkEntry, hdr volume.PageHeader) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1077,8 +1105,8 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		}
 
 		// Look up the blob for this chunk.
-		blob, err := h.store.idx.GetBlob(ctx, entry.BlobID)
-		if err != nil {
+		blob, found := lookupBlob(entry.BlobID)
+		if !found {
 			// Blob not in index — orphaned chunk. Mark for deletion.
 			deadChunks = append(deadChunks, entry)
 			bytesFreed += entry.Length
@@ -1105,10 +1133,15 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		}
 	}
 
-	// Remove from index.
+	// Remove from index. blobCache already holds every dead blob's
+	// manifest from the scan above — reuse it instead of paying for a
+	// second idx.GetBlob call purely to re-read ChunkIDs, which cannot
+	// have changed: ChunkIDs are fixed at blob creation and never mutated
+	// afterward (only RefCount changes), so the cached copy is exactly as
+	// valid here as a fresh fetch would be.
 	for _, blobID := range deadBlobs {
-		blob, err := h.store.idx.GetBlob(ctx, blobID)
-		if err != nil {
+		blob, ok := blobCache[blobID]
+		if !ok || blob == nil {
 			continue
 		}
 		for _, cid := range blob.ChunkIDs {
