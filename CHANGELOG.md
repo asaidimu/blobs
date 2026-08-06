@@ -1,3 +1,15 @@
+# [1.3.0](https://github.com/asaidimu/blobs/compare/v1.2.2...v1.3.0) (2026-08-06)
+
+
+### Bug Fixes
+
+* **chunking:** migrate to github.com/kalbasit/fastcdc ([a26c983](https://github.com/asaidimu/blobs/commit/a26c983ce8be313ced32ac100383888cd8ee1ee5))
+
+
+### Features
+
+* **volume:** implement content-defined chunking for blobs ([7389c56](https://github.com/asaidimu/blobs/commit/7389c56b6d012a9238815a36d9825b8373f3daf3)), closes [hi#performance](https://github.com/hi/issues/performance)
+
 ## [1.2.2](https://github.com/asaidimu/blobs/compare/v1.2.1...v1.2.2) (2026-08-04)
 
 
