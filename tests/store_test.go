@@ -793,22 +793,26 @@ func TestConcurrentPuts(t *testing.T) {
 	}
 }
 
-func TestLargeBlob_ExactChunkBoundary(t *testing.T) {
-	// Write a blob whose size is exactly one default chunk size (4 MB).
+func TestLargeBlob_ContentDefinedChunking(t *testing.T) {
+	// Write a blob the size of one default average chunk (4 MB). With
+	// content-defined chunking a blob of this size is typically one chunk but
+	// can legitimately be two, depending on where the content puts its
+	// boundaries — the invariant that always holds is a byte-exact
+	// round-trip, not a fixed chunk count.
 	s := openStore(t)
 	ns := s.Namespace("default")
 
 	const size = 4 * 1024 * 1024
 	original := randBytes(size)
-	info := putBytes(t, ns, "exact-chunk", original)
+	info := putBytes(t, ns, "cdc-chunk", original)
 
-	if info.Metadata.ChunkCount != 1 {
-		t.Errorf("expected 1 chunk for %d bytes, got %d", size, info.Metadata.ChunkCount)
+	if info.Metadata.ChunkCount < 1 || info.Metadata.ChunkCount > 4 {
+		t.Errorf("expected 1–4 content-defined chunks for %d bytes, got %d", size, info.Metadata.ChunkCount)
 	}
 
-	got := getBytes(t, ns, "exact-chunk")
+	got := getBytes(t, ns, "cdc-chunk")
 	if !bytes.Equal(got, original) {
-		t.Fatal("exact-chunk-boundary round-trip mismatch")
+		t.Fatal("content-defined-chunk round-trip mismatch")
 	}
 }
 

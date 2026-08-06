@@ -14,7 +14,7 @@
 //     - chunkBuf, pageBuf, sha256 hasher from sync.Pool
 //     - blobHasher.Sum into a stack array — no heap digest slice
 //     - BlobID encoded from stack buffer, converted directly to string
-//     - ChunkID built from a pooled scratch buffer — no fmt.Sprintf
+//     - ChunkID is the chunk's content hash, encoded from a stack buffer
 //     - patches slice pre-allocated cap(1); chunks slice pre-allocated cap(1)
 //     - WAL write buffer grown once per blob, from pool
 //
@@ -56,11 +56,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/asaidimu/blobs/chunking"
 	"github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/object"
 )
@@ -88,16 +87,6 @@ const (
 
 	// blobIDLen is the total length of a BlobID string: "sha256:" + 64 hex chars.
 	blobIDLen = hashPrefixLen + sha256HexLen // 71
-
-	// maxChunkSeq is the largest valid 0-based chunk sequence number.
-	// chunkIDFromBlobID uses variable-width decimal; this cap ensures
-	// no two distinct sequence numbers produce the same string, since
-	// the scratch buffer holds up to 10 decimal digits (uint32 max).
-	maxChunkSeq = math.MaxUint32 // 4 294 967 295
-
-	// chunkIDScratchLen is the max length of a ChunkID string:
-	// blobIDLen(71) + "#"(1) + max uint32 decimal(10) = 82.
-	chunkIDScratchLen = blobIDLen + 1 + 10 // 82
 )
 
 // Default tuning values.
@@ -154,63 +143,16 @@ func blobIDFromDigest(digest *[sha256.Size]byte) object.BlobID {
 	return object.BlobID(buf[:]) // one allocation: string header
 }
 
-// chunkIDPool pools scratch buffers for ChunkID construction.
-var chunkIDPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, chunkIDScratchLen)
-		return &b
-	},
-}
-
-// chunkIDFromBlobID constructs a ChunkID from a BlobID and 0-based sequence.
-// Format: "<blobID>#<decimal_seq>".
-//
-// Security invariants enforced here:
-//  1. seq must be <= maxChunkSeq (uint32 max). A seq value beyond this would
-//     require > 4 billion chunks per blob — physically impossible — but we
-//     guard it explicitly so future callers cannot produce colliding ChunkIDs.
-//  2. len(blobID) must equal blobIDLen (71). An oversized BlobID would
-//     overflow the scratch buffer and silently truncate the seq field,
-//     causing two different chunks to share the same ChunkID (index aliasing).
-func chunkIDFromBlobID(blobID object.BlobID, seq int) object.ChunkID {
-	if seq < 0 || seq > maxChunkSeq {
-		panic(fmt.Sprintf("volume: chunk sequence %d out of range [0, %d]", seq, maxChunkSeq))
-	}
-	if len(blobID) != blobIDLen {
-		panic(fmt.Sprintf("volume: BlobID length %d != expected %d — non-canonical BlobID would corrupt ChunkID", len(blobID), blobIDLen))
-	}
-
-	p := chunkIDPool.Get().(*[]byte)
-	scratch := *p
-
-	n := copy(scratch, blobID)
-	scratch[n] = '#'
-	n++
-	n += appendDecimal(scratch[n:], uint64(seq))
-
-	result := object.ChunkID(scratch[:n]) // one allocation: string copy
-	chunkIDPool.Put(p)
-	return result
-}
-
-// appendDecimal writes v as a decimal integer into dst and returns the number
-// of bytes written. Variable-width — no leading zeros, no fixed-width truncation.
-// Uses no allocation. dst must be at least 20 bytes (max uint64 decimal length).
-func appendDecimal(dst []byte, v uint64) int {
-	if v == 0 {
-		dst[0] = '0'
-		return 1
-	}
-	// Write digits in reverse, then flip.
-	var tmp [20]byte
-	pos := 20
-	for v > 0 {
-		pos--
-		tmp[pos] = byte('0' + v%10)
-		v /= 10
-	}
-	n := copy(dst, tmp[pos:])
-	return n
+// chunkIDFromContent constructs a content-addressed ChunkID from a chunk's raw
+// SHA-256 digest: "sha256:<hex>". Chunk identity is the chunk's own content
+// hash, so identical runs of bytes produce the same ChunkID no matter which
+// blob wrote them — the foundation of cross-blob deduplication. The result is
+// the same length (71) as a BlobID.
+func chunkIDFromContent(digest [sha256.Size]byte) object.ChunkID {
+	var buf [blobIDLen]byte
+	copy(buf[:hashPrefixLen], hashPrefix)
+	hex.Encode(buf[hashPrefixLen:], digest[:])
+	return object.ChunkID(buf[:]) // one allocation: string header
 }
 
 // ── pageHeader ────────────────────────────────────────────────────────────────
@@ -502,21 +444,28 @@ func (e *Engine) IsDirty() bool {
 	return err == nil
 }
 
-// WriteBlob reads all bytes from r, splits into chunks, writes durably.
+// WriteBlob reads all bytes from r, splits into content-defined chunks via
+// FastCDC, and writes them durably. Chunk boundaries are a function of the
+// bytes themselves (see package chunking), and every chunk's identity is its
+// own content hash — so a blob and a blob-plus-a-prefix share their unchanged
+// chunks. Cross-blob reuse of those shared chunks happens at the store layer
+// (index refcounting); this engine always writes every chunk it is given.
 //
 // Allocation budget per blob:
 //   - 1 × WriteResult escape (unavoidable — caller receives a pointer)
 //   - 1 × []ChunkEntry backing array (result.Chunks)
 //   - 2 × string header per chunk (BlobID + ChunkID — Go string-from-[]byte)
-//   - Pool borrows (chunkBuf, pageBuf, hasher, walBuf, chunkIDScratch): zero net
+//   - Pool borrows (pageBuf, hasher, walBuf, chunkIDScratch): zero net
 //
 // Lock is held only during bw.Write(pageBuf) — not during I/O or hashing.
 func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
-	chunkBuf := getChunkBuf(e.opts.ChunkSize)
-	defer putChunkBuf(chunkBuf)
-
 	blobHasher := getHasher()
 	defer putHasher(blobHasher)
+
+	chunker, err := chunking.New(r, chunking.Options{Avg: int(e.opts.ChunkSize)})
+	if err != nil {
+		return nil, fmt.Errorf("volume: chunker: %w", err)
+	}
 
 	// Pre-allocate cap(1) — covers the common single-chunk case without growth.
 	chunks := make([]object.ChunkEntry, 0, 1)
@@ -533,15 +482,16 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 	)
 
 	for {
-		n, readErr := io.ReadFull(r, chunkBuf)
-		if n == 0 && readErr == io.EOF {
+		c, err := chunker.Next()
+		if err == io.EOF {
 			break
 		}
-		if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-			return nil, fmt.Errorf("volume: read input: %w", readErr)
+		if err != nil {
+			return nil, fmt.Errorf("volume: chunk input: %w", err)
 		}
 
-		payload := chunkBuf[:n]
+		payload := c.Data
+		n := len(payload)
 		total += int64(n)
 
 		// Hash and CRC computed outside the lock.
@@ -577,6 +527,7 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 		}
 
 		chunks = append(chunks, object.ChunkEntry{
+			ChunkID:     chunkIDFromContent(chunkHashArr),
 			SegmentID:   object.SegmentID(segSeq),
 			NamespaceID: e.nsID,
 			PageOffset:  pageOffset,
@@ -586,10 +537,6 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 		})
 		patches = append(patches, patchTarget{segSeq, pageOffset})
 		chunkSeq++
-
-		if readErr == io.ErrUnexpectedEOF || readErr == io.EOF {
-			break
-		}
 	}
 
 	if len(chunks) == 0 {
@@ -621,7 +568,6 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 			return nil, fmt.Errorf("volume: patch page %d: %w", i, err)
 		}
 		chunks[i].BlobID = blobID
-		chunks[i].ChunkID = chunkIDFromBlobID(blobID, i)
 	}
 
 	// fsync and WAL under lock so the active pointer is stable.
@@ -939,7 +885,7 @@ func (e *Engine) RewriteSegment(oldSegID object.SegmentID) (*SegmentRewriteResul
 
 		blobIDStr := blobIDFromDigest((*[sha256.Size]byte)(hdr.BlobID[:]))
 		relocated = append(relocated, object.ChunkEntry{
-			ChunkID:     chunkIDFromBlobID(blobIDStr, int(hdr.ChunkSeq)),
+			ChunkID:     chunkIDFromContent(hdr.ChunkID),
 			BlobID:      blobIDStr,
 			SegmentID:   object.SegmentID(newSeq),
 			NamespaceID: e.nsID,
@@ -1161,21 +1107,17 @@ func decodeWALEntry(buf []byte, nsID string, pageCapacity int64) (entry WALEntry
 			return WALEntry{}, 0, false
 		}
 
-		seq, seqOK := chunkSeqFromChunkID(chunkID)
-		if !seqOK || seq < 0 || seq >= int(chunkCount) {
-			// A ChunkID that doesn't parse, or whose embedded sequence
-			// falls outside this entry's own chunk count, indicates a
-			// corrupt or foreign record — safer to discard the whole
-			// entry than to guess at a placement for it.
-			return WALEntry{}, 0, false
-		}
-
+		// ChunkID is content-addressed (see chunkIDFromContent); it carries
+		// no sequence. Seq is the chunk's position within this WAL entry,
+		// which matches the order WriteBlob appended the chunks. Entry
+		// boundaries are validated below: every chunk's location must fall
+		// inside this entry's declared chunkCount.
 		pages := (int64(length) + pageCapacity - 1) / pageCapacity
 		if pages < 1 {
 			pages = 1
 		}
 
-		chunks[seq] = object.ChunkEntry{
+		chunks[i] = object.ChunkEntry{
 			ChunkID:     chunkID,
 			BlobID:      blobID,
 			SegmentID:   object.SegmentID(segIDRaw),
@@ -1183,27 +1125,11 @@ func decodeWALEntry(buf []byte, nsID string, pageCapacity int64) (entry WALEntry
 			PageOffset:  int64(pageOffset),
 			PageCount:   int(pages),
 			Length:      int64(length),
-			Seq:         seq,
+			Seq:         int(i),
 		}
 	}
 
 	return WALEntry{BlobID: blobID, Chunks: chunks}, pos, true
-}
-
-// chunkSeqFromChunkID parses the sequence number back out of a ChunkID's
-// "<blobID>#<seq>" format (see object.NewChunkID). Used instead of
-// trusting WAL entry position so a chunk's Seq is self-describing.
-func chunkSeqFromChunkID(id object.ChunkID) (int, bool) {
-	s := string(id)
-	i := strings.LastIndexByte(s, '#')
-	if i < 0 || i == len(s)-1 {
-		return 0, false
-	}
-	seq, err := strconv.Atoi(s[i+1:])
-	if err != nil || seq < 0 {
-		return 0, false
-	}
-	return seq, true
 }
 
 // Close flushes and closes the active segment, clears the dirty flag.
@@ -1379,7 +1305,7 @@ func (e *Engine) scanSegFile(path string, seq uint64, fn func(object.ChunkEntry,
 
 		flags, _ := decodeMagicFlags(hdr.MagicFlags)
 		blobIDStr := blobIDFromDigest((*[sha256.Size]byte)(hdr.BlobID[:]))
-		chunkID := chunkIDFromBlobID(blobIDStr, int(hdr.ChunkSeq))
+		chunkID := chunkIDFromContent(hdr.ChunkID)
 
 		capacity := pageSize - pageHeaderSize
 		pagesForChunk := (int64(hdr.DataLen) + capacity - 1) / capacity

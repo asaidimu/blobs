@@ -69,6 +69,7 @@ func prefixNS() []byte                  { return []byte("ns:") }
 func keyRef(nsID, key string) []byte    { return []byte("ref:" + nsID + ":" + key) }
 func prefixRef(nsID string) []byte      { return []byte("ref:" + nsID + ":") }
 func keyBlob(id object.BlobID) []byte   { return []byte("blob:" + string(id)) }
+func prefixBlob() []byte                { return []byte("blob:") }
 func keyChunk(id object.ChunkID) []byte { return []byte("chunk:" + string(id)) }
 func keySeg(nsID string, id object.SegmentID) []byte {
 	return fmt.Appendf(nil, "seg:%s:%s", nsID, id.String())
@@ -208,6 +209,29 @@ func (idx *Index) GetBlob(ctx context.Context, id object.BlobID) (*object.BlobEn
 
 func (idx *Index) DeleteBlob(ctx context.Context, id object.BlobID) error {
 	return idx.b.Delete(ctx, keyBlob(id))
+}
+
+// PurgeDeadBlobs removes every blob manifest whose RefCount has reached
+// zero. Blob records are keyed by content and hold no owned data — chunk
+// records are independent and carry their own refcounts — so removing a
+// dead manifest is always safe and never drops live bytes. Returns the
+// number of manifests removed.
+func (idx *Index) PurgeDeadBlobs(ctx context.Context) (int, error) {
+	var removed int
+	err := idx.b.Scan(ctx, prefixBlob(), func(k, v []byte) error {
+		var blob object.BlobEntry
+		if err := unmarshal(v, &blob); err != nil {
+			return err
+		}
+		if blob.RefCount == 0 {
+			if err := idx.b.Delete(ctx, k); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	})
+	return removed, err
 }
 
 // ── Chunks ────────────────────────────────────────────────────────────────────
@@ -354,13 +378,23 @@ func putStatsTx(tx Tx, stats object.NamespaceStats) error {
 // CommitPut atomically writes a new blob to the index and updates stats.
 // Handles both new keys and overwrites. Must be called after the volume
 // engine has durably written all chunks to disk.
+// CommitPut atomically writes a new blob to the index and updates stats.
+// Handles both new keys and overwrites. Must be called after the volume
+// engine has durably written all chunks to disk.
+//
+// Chunks are content-addressed, so CommitPut deduplicates at chunk
+// granularity: if a chunk with the same content hash is already indexed,
+// its existing physical location is reused (RefCount incremented) and the
+// newly written duplicate is returned in the result for the caller to mark
+// deleted. The returned entries are exactly the physical copies that are
+// now unreferenced and safe to reap.
 func (idx *Index) CommitPut(
 	ctx context.Context,
 	ref object.RefEntry,
 	blob object.BlobEntry,
 	chunks []object.ChunkEntry,
-) error {
-	return idx.b.Tx(ctx, func(tx Tx) error {
+) (reused []object.ChunkEntry, err error) {
+	err = idx.b.Tx(ctx, func(tx Tx) error {
 		// 1. Check for existing ref (overwrite detection).
 		var oldBlobID object.BlobID
 		var oldBlobSize int64
@@ -380,6 +414,7 @@ func (idx *Index) CommitPut(
 			oldBlobSize = oldRef.Metadata.Size
 			oldChunkCount = int64(oldRef.Metadata.ChunkCount)
 		}
+		sameContent := isOverwrite && oldBlobID == ref.BlobID
 
 		// 2. Write the ref.
 		refVal, err := marshal(ref)
@@ -423,8 +458,10 @@ func (idx *Index) CommitPut(
 			}
 		}
 
-		// 4. Decrement old blob RefCount if overwriting with different content.
-		if isOverwrite && oldBlobID != ref.BlobID {
+		// 4. Decrement the old blob's refcount and chunk refcounts if an
+		//    overwrite replaced it with different content.
+		var deadBytes, deadChunks int64
+		if isOverwrite && !sameContent {
 			raw, err := tx.Get(keyBlob(oldBlobID))
 			if err != nil && !IsNotFound(err) {
 				return err
@@ -442,18 +479,66 @@ func (idx *Index) CommitPut(
 				if err := tx.Put(keyBlob(oldBlobID), v); err != nil {
 					return err
 				}
+
+				// Old chunks lose one reference; those reaching zero are dead.
+				for _, cid := range oldBlob.ChunkIDs {
+					deadLen, err := decrementChunkRefTx(tx, cid)
+					if err != nil {
+						return err
+					}
+					if deadLen > 0 {
+						deadBytes += deadLen
+						deadChunks++
+					}
+				}
 			}
 		}
 
-		// 5. Write chunk entries (idempotent — dedup means chunk may pre-exist).
+		// 5. Upsert chunk entries with refcount-aware dedup. Chunks whose
+		//    content hash is already indexed are reused: we keep the existing
+		//    location, bump its RefCount, and report the freshly written
+		//    duplicate back to the caller for reaping.
+		//
+		//    Reuse is limited to chunks already indexed in THIS namespace:
+		//    a chunk's location is a (segment, page) inside its namespace's
+		//    own segment files, and a reader can only open its own
+		//    namespace's engine. Pointing a blob at a foreign namespace's
+		//    location would make reads fail, so an existing record owned by
+		//    another namespace is treated as absent — we register our own
+		//    copy instead (the pre-dedup behavior).
+		var newPhysicalBytes int64
 		for _, chunk := range chunks {
-			chunkVal, err := marshal(chunk)
+			existingRaw, err := tx.Get(keyChunk(chunk.ChunkID))
+			if err == nil {
+				var existing object.ChunkEntry
+				if err := unmarshal(existingRaw, &existing); err != nil {
+					return err
+				}
+				if existing.NamespaceID == ref.NamespaceID {
+					existing.RefCount++
+					v, err := marshal(existing)
+					if err != nil {
+						return err
+					}
+					if err := tx.Put(keyChunk(chunk.ChunkID), v); err != nil {
+						return err
+					}
+					reused = append(reused, chunk)
+					continue
+				}
+				// Fall through: foreign namespace's record — keep our copy.
+			} else if !IsNotFound(err) {
+				return err
+			}
+			chunk.RefCount = 1
+			v, err := marshal(chunk)
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyChunk(chunk.ChunkID), chunkVal); err != nil {
+			if err := tx.Put(keyChunk(chunk.ChunkID), v); err != nil {
 				return err
 			}
+			newPhysicalBytes += chunk.Length
 		}
 
 		// 6. Update stats.
@@ -463,19 +548,61 @@ func (idx *Index) CommitPut(
 		}
 		if !isOverwrite {
 			stats.BlobCount++
-		} else if oldBlobID != ref.BlobID {
-			// Different content replaces old — old bytes become dead.
-			stats.DeadBytes += oldBlobSize
-			stats.DeadChunks += oldChunkCount
+			stats.BytesStored += blob.TotalSize
+			stats.ChunkCount += int64(len(chunks))
+		} else if !sameContent {
+			// Different content replaces old — adjust logical accounting;
+			// old bytes that fully lost their references were already
+			// counted as dead in step 4.
+			stats.BytesStored += blob.TotalSize - oldBlobSize
+			stats.ChunkCount += int64(len(chunks)) - oldChunkCount
 		}
-		stats.BytesStored += blob.TotalSize
-		stats.ChunkCount += int64(len(chunks))
+		stats.BytesPhysical += newPhysicalBytes
+		stats.DeadBytes += deadBytes
+		stats.DeadChunks += deadChunks
 		return putStatsTx(tx, stats)
 	})
+	if err != nil {
+		return nil, err
+	}
+	return reused, nil
+}
+
+// decrementChunkRefTx removes one reference from a chunk's index record.
+// A chunk whose RefCount reaches zero is left in place with RefCount 0 —
+// Compact's phase 1 sweep reaps it. Requires a live transaction. Returns
+// the chunk's payload length when the reference count drops to zero
+// (report it as newly dead bytes), and 0 otherwise.
+func decrementChunkRefTx(tx Tx, cid object.ChunkID) (int64, error) {
+	raw, err := tx.Get(keyChunk(cid))
+	if err != nil && !IsNotFound(err) {
+		return 0, err
+	}
+	if err != nil {
+		return 0, nil // already gone; nothing to do
+	}
+	var chunk object.ChunkEntry
+	if err := unmarshal(raw, &chunk); err != nil {
+		return 0, err
+	}
+	deadLen := int64(0)
+	if chunk.RefCount > 0 {
+		chunk.RefCount--
+		if chunk.RefCount == 0 {
+			deadLen = chunk.Length
+		}
+	}
+	v, err := marshal(chunk)
+	if err != nil {
+		return 0, err
+	}
+	return deadLen, tx.Put(keyChunk(cid), v)
 }
 
 // CommitDelete atomically removes a ref and decrements the blob's RefCount.
-// Physical bytes are not reclaimed until Compact runs.
+// Each referenced chunk also loses one reference; chunks reaching zero are
+// reported as dead bytes in the stats. Physical bytes are not reclaimed
+// until Compact runs.
 func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 	return idx.b.Tx(ctx, func(tx Tx) error {
 		raw, err := tx.Get(keyRef(nsID, key))
@@ -492,23 +619,25 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 		}
 
 		// Decrement blob RefCount.
+		var blob *object.BlobEntry
 		blobRaw, err := tx.Get(keyBlob(ref.BlobID))
 		if err != nil && !IsNotFound(err) {
 			return err
 		}
 		if err == nil {
-			var blob object.BlobEntry
-			if err := unmarshal(blobRaw, &blob); err != nil {
+			var b object.BlobEntry
+			if err := unmarshal(blobRaw, &b); err != nil {
 				return err
 			}
-			blob.RefCount--
-			v, err := marshal(blob)
+			b.RefCount--
+			v, err := marshal(b)
 			if err != nil {
 				return err
 			}
 			if err := tx.Put(keyBlob(ref.BlobID), v); err != nil {
 				return err
 			}
+			blob = &b
 		}
 
 		// Update stats.
@@ -517,8 +646,21 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 			return err
 		}
 		stats.BlobCount--
-		stats.DeadBytes += ref.Metadata.Size
-		stats.DeadChunks += int64(ref.Metadata.ChunkCount)
+		stats.BytesStored -= ref.Metadata.Size
+		stats.ChunkCount -= int64(ref.Metadata.ChunkCount)
+		if blob != nil {
+			// Decrement each chunk's RefCount; those hitting zero are dead.
+			for _, cid := range blob.ChunkIDs {
+				deadLen, err := decrementChunkRefTx(tx, cid)
+				if err != nil {
+					return err
+				}
+				if deadLen > 0 {
+					stats.DeadBytes += deadLen
+					stats.DeadChunks++
+				}
+			}
+		}
 		return putStatsTx(tx, stats)
 	})
 }

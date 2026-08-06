@@ -389,6 +389,10 @@ func (s *Store) replayWAL(ctx context.Context, nsID string, eng *volume.Engine) 
 			var totalSize int64
 			chunkIDs := make([]object.ChunkID, len(entry.Chunks))
 			for _, c := range entry.Chunks {
+				// Presumed referenced, mirroring the blob's RefCount: 1 —
+				// see openEngine's doc comment. A chunk whose WAL entry
+				// survived a crash is referenced by the blob that wrote it.
+				c.RefCount = 1
 				if err := s.idx.PutChunk(ctx, c); err != nil {
 					return fmt.Errorf("replay chunk %s: %w", c.ChunkID, err)
 				}
@@ -615,8 +619,16 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 	}
 
 	// Phase 2 — atomically commit ref + blob + chunks to index.
-	if err := h.store.idx.CommitPut(ctx, ref, blob, result.Chunks); err != nil {
+	// Chunks whose content was already indexed are reused; their just-written
+	// physical copies come back in `reused` and are reaped immediately.
+	reused, err := h.store.idx.CommitPut(ctx, ref, blob, result.Chunks)
+	if err != nil {
 		return nil, fmt.Errorf("store: commit to index: %w", err)
+	}
+	for _, dup := range reused {
+		if err := eng.MarkDeleted(dup); err != nil {
+			return nil, fmt.Errorf("store: reap duplicate chunk %s: %w", dup.ChunkID, err)
+		}
 	}
 
 	return &object.BlobInfo{Key: key, NamespaceID: h.nsID, Metadata: meta}, nil
@@ -926,6 +938,11 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 		if hdr.Flags.IsDeleted() {
 			return nil // dead page — do not resurrect it into the rebuilt index
 		}
+		// Presumed referenced: the location recorded here IS the canonical
+		// copy on disk, and Compact's phase 1 reaps only chunks whose
+		// index record has RefCount <= 0 (or whose location doesn't match
+		// the physical page). See the RefCount: 1 rationale below.
+		entry.RefCount = 1
 		if err := h.store.idx.PutChunk(ctx, entry); err != nil {
 			return fmt.Errorf("rebuild chunk %s: %w", entry.ChunkID, err)
 		}
@@ -1055,6 +1072,15 @@ func (h *NamespaceHandle) CompactWithOptions(ctx context.Context, opts CompactOp
 
 // compactPhase1 marks orphaned chunks deleted and removes their index
 // records. See Compact's doc comment.
+//
+// A chunk is live if and only if its index record still has RefCount > 0.
+// ScanSegments yields one entry per page while the index record is per
+// chunk (which can span many pages), so a page's liveness cannot be judged
+// by comparing offsets — only the record's reference count decides.
+// Deleting a blob decrements every chunk it references (see CommitDelete),
+// and only when the last referencing blob is gone does RefCount reach zero
+// and the chunk become collectable — which is exactly what keeps a chunk
+// shared between blob A and blob B alive after A is deleted.
 func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, error) {
 	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
@@ -1062,38 +1088,31 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	}
 	defer h.store.endNSOp(h.nsID)
 
-	// Collect all chunk entries that belong to blobs with RefCount == 0.
-	// We scan segment files (the ground truth) and cross-reference the index.
 	var (
-		deadChunks  []object.ChunkEntry
-		deadBlobs   []object.BlobID
-		bytesFreed  int64
-		chunksFreed int64
+		deadChunks   []object.ChunkEntry   // physical pages to mark deleted
+		deadChunkIDs []object.ChunkID    // index records with RefCount == 0 to remove
+		bytesFreed   int64
+		chunksFreed  int64
 	)
 
-	// blobCache avoids re-fetching the same blob manifest from the index
-	// once per chunk: ScanSegments visits every chunk of every blob, so
-	// without this, a blob with N chunks triggers N identical idx.GetBlob
-	// calls for the exact same record — for a large chunked file (a
-	// multi-gigabyte blob split into hundreds of chunks), that's hundreds
-	// of redundant index round trips to answer a question ("is this blob
-	// dead?") whose answer doesn't change chunk to chunk. A nil cached
-	// entry marks a BlobID we've already confirmed is missing from the
-	// index, so an orphaned chunk's every other chunk doesn't re-attempt
-	// — and re-fail — the same lookup either.
-	blobCache := make(map[object.BlobID]*object.BlobEntry)
+	// indexCache avoids re-fetching the same chunk record from the index
+	// once per physical page: ScanSegments visits every page of a chunk,
+	// and a chunk shared across blobs is hit many times. A nil cached
+	// entry marks a ChunkID already confirmed absent.
+	indexCache := make(map[object.ChunkID]*object.ChunkEntry)
+	deadIDSeen := make(map[object.ChunkID]struct{})
 
-	lookupBlob := func(id object.BlobID) (*object.BlobEntry, bool) {
-		if blob, cached := blobCache[id]; cached {
-			return blob, blob != nil
+	lookupChunk := func(id object.ChunkID) *object.ChunkEntry {
+		if c, ok := indexCache[id]; ok {
+			return c
 		}
-		blob, err := h.store.idx.GetBlob(ctx, id)
+		c, err := h.store.idx.GetChunk(ctx, id)
 		if err != nil {
-			blobCache[id] = nil
-			return nil, false
+			indexCache[id] = nil
+			return nil
 		}
-		blobCache[id] = blob
-		return blob, true
+		indexCache[id] = c
+		return c
 	}
 
 	if err := eng.ScanSegments(func(entry object.ChunkEntry, hdr volume.PageHeader) error {
@@ -1104,22 +1123,17 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 			return nil
 		}
 
-		// Look up the blob for this chunk.
-		blob, found := lookupBlob(entry.BlobID)
-		if !found {
-			// Blob not in index — orphaned chunk. Mark for deletion.
-			deadChunks = append(deadChunks, entry)
-			bytesFreed += entry.Length
-			chunksFreed++
-			return nil
+		indexed := lookupChunk(entry.ChunkID)
+		if indexed != nil && indexed.RefCount > 0 {
+			return nil // live — referenced by at least one blob
 		}
-		if blob.RefCount == 0 {
-			deadChunks = append(deadChunks, entry)
-			bytesFreed += entry.Length
-			chunksFreed++
-			if len(deadBlobs) == 0 || deadBlobs[len(deadBlobs)-1] != blob.BlobID {
-				deadBlobs = append(deadBlobs, blob.BlobID)
-			}
+
+		deadChunks = append(deadChunks, entry)
+		bytesFreed += entry.Length
+		chunksFreed++
+		if _, ok := deadIDSeen[entry.ChunkID]; !ok {
+			deadIDSeen[entry.ChunkID] = struct{}{}
+			deadChunkIDs = append(deadChunkIDs, entry.ChunkID)
 		}
 		return nil
 	}); err != nil {
@@ -1133,25 +1147,25 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		}
 	}
 
-	// Remove from index. blobCache already holds every dead blob's
-	// manifest from the scan above — reuse it instead of paying for a
-	// second idx.GetBlob call purely to re-read ChunkIDs, which cannot
-	// have changed: ChunkIDs are fixed at blob creation and never mutated
-	// afterward (only RefCount changes), so the cached copy is exactly as
-	// valid here as a fresh fetch would be.
-	for _, blobID := range deadBlobs {
-		blob, ok := blobCache[blobID]
-		if !ok || blob == nil {
-			continue
+	// Remove index records for chunks whose RefCount reached zero. Phantom
+	// duplicate pages (dead but sharing a live chunk's content hash) leave
+	// the index record alone — it belongs to the live canonical copy.
+	for _, cid := range deadChunkIDs {
+		if err := h.store.idx.DeleteChunk(ctx, cid); err != nil {
+			return CompactResult{}, fmt.Errorf("store: delete chunk record: %w", err)
 		}
-		for _, cid := range blob.ChunkIDs {
-			_ = h.store.idx.DeleteChunk(ctx, cid)
-		}
-		_ = h.store.idx.DeleteBlob(ctx, blobID)
+	}
+
+	// Sweep blob manifests nobody references anymore. Safe regardless of
+	// chunk sharing: chunk records are keyed by content and own their own
+	// refcounts, so removing a dead blob entry never drops live data.
+	blobsRemoved, err := h.store.idx.PurgeDeadBlobs(ctx)
+	if err != nil {
+		return CompactResult{}, fmt.Errorf("store: purge dead blobs: %w", err)
 	}
 
 	return CompactResult{
-		BlobsRemoved:  int64(len(deadBlobs)),
+		BlobsRemoved:  int64(blobsRemoved),
 		ChunksRemoved: chunksFreed,
 		BytesFreed:    bytesFreed,
 	}, nil

@@ -19,9 +19,12 @@ func (id BlobID) String() string  { return string(id) }
 func (id BlobID) IsZero() bool    { return id == "" }
 
 // ChunkID uniquely identifies a chunk within the volume engine.
-// Format: "<blobID>#<seq06d>"
-// The embedded BlobID and sequence make the chunk self-describing
-// during index reconstruction from raw segment scans.
+//
+// Production chunk IDs are content-addressed: "sha256:<hex>" over the chunk's
+// own bytes (see volume.chunkIDFromContent), so identical runs of bytes in
+// different blobs share one ChunkID — the foundation of cross-blob
+// deduplication. NewChunkID below remains available as a legacy/utility
+// constructor for the older "<blobID>#<seq>" format.
 type ChunkID string
 
 // canonicalBlobIDLen is the expected byte length of a canonical BlobID:
@@ -124,6 +127,7 @@ type ChunkEntry struct {
 	PageCount   int       `json:"page_count"`  // number of pages this chunk occupies
 	Length      int64     `json:"length"`      // payload byte length (excludes page headers/padding)
 	Seq         int       `json:"seq"`         // 0-based position within the blob
+	RefCount    int64     `json:"ref_count"`   // blobs referencing this content; zero means GC-eligible
 }
 
 // SegmentState describes the lifecycle of a segment file.
