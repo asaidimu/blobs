@@ -10,7 +10,7 @@
 //
 // The implementation is the FastCDC 2020 algorithm
 // (https://ieeexplore.ieee.org/document/9055082), provided by the dependency
-// github.com/buildbuddy-io/fastcdc2020. This package is a thin, stable wrapper:
+// github.com/kalbasit/fastcdc. This package is a thin, stable wrapper:
 // it owns the configuration defaults (min = avg/4, max = avg*4, normalized
 // chunking at level 2) and exposes a streaming Next loop that the volume engine
 // consumes, keeping the store code independent of the upstream API.
@@ -19,7 +19,7 @@ package chunking
 import (
 	"io"
 
-	"github.com/buildbuddy-io/fastcdc2020/fastcdc"
+	"github.com/kalbasit/fastcdc"
 )
 
 // DefaultNormalization is the FastCDC "normalized chunking" level used when
@@ -34,8 +34,8 @@ type Options struct {
 	// Min is the lower bound for chunk sizes. Defaults to Avg/4.
 	// The last chunk of a stream may still undercut Min.
 	Min int
-	// Avg is the target average chunk size. Required; must be a power of two
-	// in the range 64 bytes to 1 GiB (FastCDC's own constraint).
+	// Avg is the target average chunk size. Required; must be >= 4 (the
+	// default Min = Avg/4 must stay >= 1). No power-of-two constraint.
 	Avg int
 	// Max is the upper bound for chunk sizes. Defaults to Avg*4. A boundary
 	// is forced at Max even if the content never suggests one.
@@ -78,10 +78,10 @@ func New(r io.Reader, opts Options) (*Chunker, error) {
 
 	inner, err := fastcdc.NewChunker(
 		r,
-		opts.Avg,
-		fastcdc.WithMinSize(opts.Min),
-		fastcdc.WithMaxSize(opts.Max),
-		fastcdc.WithNormalization(opts.Normalization),
+		fastcdc.WithTargetSize(uint32(opts.Avg)),
+		fastcdc.WithMinSize(uint32(opts.Min)),
+		fastcdc.WithMaxSize(uint32(opts.Max)),
+		fastcdc.WithNormalization(uint8(opts.Normalization)),
 	)
 	if err != nil {
 		return nil, err
@@ -119,7 +119,7 @@ func (c *Chunker) Next() (*Chunk, error) {
 	}
 	return &Chunk{
 		Offset: int64(chunk.Offset),
-		Size:   chunk.Length,
+		Size:   int(chunk.Length),
 		Data:   chunk.Data,
 	}, nil
 }

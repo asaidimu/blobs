@@ -171,10 +171,18 @@ func TestEmptyInput_EarlyEOF(t *testing.T) {
 	}
 }
 
-func TestNew_RejectsBadAverage(t *testing.T) {
-	for _, avg := range []int{3, 5, -8} {
+func TestNew_RejectsInvalidAverage(t *testing.T) {
+	for _, avg := range []int{1, 2, 3, -8} {
 		if _, err := New(bytes.NewReader(nil), Options{Avg: avg}); err == nil {
-			t.Errorf("Avg=%d: expected an error (must be power of two >= 4 up to 1GiB)", avg)
+			t.Errorf("Avg=%d: expected an error (default Min = Avg/4 must be >= 1)", avg)
+		}
+	}
+}
+
+func TestNew_AcceptsNonPowerOfTwoAverage(t *testing.T) {
+	for _, avg := range []int{5, 100000, 600 * 1024} {
+		if _, err := New(bytes.NewReader(nil), Options{Avg: avg}); err != nil {
+			t.Errorf("Avg=%d: unexpected error %v", avg, err)
 		}
 	}
 }
