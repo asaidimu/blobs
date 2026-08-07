@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/asaidimu/blobs/compare/v1.3.0...v1.3.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* **staging:** support trailing partial blocks in aligned uploads ([fa7696c](https://github.com/asaidimu/blobs/commit/fa7696c41c3dcc50a8a55b621c4914ebfadd2174))
+
 # [1.3.0](https://github.com/asaidimu/blobs/compare/v1.2.2...v1.3.0) (2026-08-06)
 
 
