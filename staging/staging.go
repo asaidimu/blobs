@@ -393,10 +393,10 @@ func (m *Manager) Begin(ctx context.Context, nsID, key string, opts BeginOptions
 		if opts.ExpectedSize <= 0 {
 			return nil, fmt.Errorf("staging: BlockSize requires ExpectedSize > 0")
 		}
-		if opts.ExpectedSize%blockSize != 0 {
-			return nil, fmt.Errorf("staging: ExpectedSize must be multiple of BlockSize")
+		if len(opts.PieceHashes) > 0 && opts.ExpectedSize%blockSize != 0 {
+			return nil, fmt.Errorf("staging: ExpectedSize must be multiple of BlockSize when PieceHashes are provided")
 		}
-		numBlocks := opts.ExpectedSize / blockSize
+		numBlocks := blockCountFor(opts.ExpectedSize, blockSize)
 		if len(opts.PieceHashes) > 0 && int64(len(opts.PieceHashes)) != numBlocks {
 			return nil, ErrPieceCountMismatch
 		}
@@ -451,7 +451,7 @@ func (m *Manager) Begin(ctx context.Context, nsID, key string, opts BeginOptions
 		pieces:      opts.PieceHashes,
 	}
 	if blockSize > 0 {
-		numBlocks := opts.ExpectedSize / blockSize
+		numBlocks := blockCountFor(opts.ExpectedSize, blockSize)
 		state.bitmap = newBlockBitmap(numBlocks)
 		if len(opts.PieceHashes) > 0 {
 			state.verified = newBlockBitmap(numBlocks)
@@ -499,7 +499,8 @@ func (m *Manager) Ranges(id string) (RangeSet, error) {
 	// Reconstruct from bitmap
 	rs := make(RangeSet, 0)
 	bs := state.blockSize
-	numBlocks := state.meta.ExpectedSize / bs
+	numBlocks := blockCountFor(state.meta.ExpectedSize, bs)
+	expSize := state.meta.ExpectedSize
 	start := int64(-1)
 	for i := int64(0); i < numBlocks; i++ {
 		word := i / 64
@@ -510,13 +511,13 @@ func (m *Manager) Ranges(id string) (RangeSet, error) {
 			}
 		} else {
 			if start != -1 {
-				rs = append(rs, ByteRange{start, i * bs})
+				rs = append(rs, ByteRange{start, blockEndBoundary(i, bs, expSize)})
 				start = -1
 			}
 		}
 	}
 	if start != -1 {
-		rs = append(rs, ByteRange{start, numBlocks * bs})
+		rs = append(rs, ByteRange{start, blockEndBoundary(numBlocks, bs, expSize)})
 	}
 	return rs, nil
 }
@@ -524,8 +525,10 @@ func (m *Manager) Ranges(id string) (RangeSet, error) {
 // WriteChunk writes chunk to session id at offset using random-access WriteAt (pwrite).
 // Out-of-order and parallel chunk writes are supported natively.
 //
-// If the session was created with BlockSize > 0, the offset and chunk length
-// must be multiples of the block size.
+// If the session was created with BlockSize > 0, the offset must be a multiple
+// of the block size and the chunk length must be a whole number of blocks, or a
+// single trailing chunk ending exactly at the expected file size (whose final
+// block may be shorter than the block size).
 func (m *Manager) WriteChunk(ctx context.Context, id string, offset int64, chunk io.Reader, expectedSHA256 string) (int64, error) {
 	if chunk == nil {
 		return 0, fmt.Errorf("staging: chunk reader is nil")
@@ -590,10 +593,10 @@ func (m *Manager) writeChunkAligned(ctx context.Context, state *sessionState, id
 	if chunkLen == 0 {
 		return state.progress(), nil
 	}
-	if chunkLen%bs != 0 {
-		return state.progress(), fmt.Errorf("%w: chunk size %d not multiple of %d", ErrBlockAlignment, chunkLen, bs)
-	}
-	if offset+chunkLen > state.meta.ExpectedSize {
+	if !state.validBlockChunk(offset, chunkLen) {
+		if chunkLen%bs != 0 {
+			return state.progress(), fmt.Errorf("%w: chunk size %d must be block-aligned or end at the expected file size (block size %d)", ErrBlockAlignment, chunkLen, bs)
+		}
 		return state.progress(), fmt.Errorf("staging: chunk exceeds expected size")
 	}
 
@@ -682,10 +685,10 @@ func (m *Manager) writeChunkAlignedStream(state *sessionState, f *os.File, offse
 	if written == 0 {
 		return state.progress(), nil
 	}
-	if written%bs != 0 {
-		return state.progress(), fmt.Errorf("%w: chunk size %d not multiple of %d", ErrBlockAlignment, written, bs)
-	}
-	if offset+written > state.meta.ExpectedSize {
+	if !state.validBlockChunk(offset, written) {
+		if written%bs != 0 {
+			return state.progress(), fmt.Errorf("%w: chunk size %d must be block-aligned or end at the expected file size (block size %d)", ErrBlockAlignment, written, bs)
+		}
 		return state.progress(), fmt.Errorf("staging: chunk exceeds expected size")
 	}
 
@@ -1088,7 +1091,7 @@ func (m *Manager) getOrLoadSession(id string) (*sessionState, error) {
 		pieces:      meta.PieceHashes,
 	}
 	if meta.BlockSize > 0 {
-		numBlocks := meta.ExpectedSize / meta.BlockSize
+		numBlocks := blockCountFor(meta.ExpectedSize, meta.BlockSize)
 		state.bitmap = newBlockBitmap(numBlocks)
 		if len(meta.PieceHashes) > 0 {
 			state.verified = newBlockBitmap(numBlocks)
@@ -1167,6 +1170,10 @@ func (m *Manager) maybeFlushMetaLocked(state *sessionState) error {
 
 // progress returns total bytes received (block‑aligned only).
 func (state *sessionState) progress() int64 {
+	bs := state.blockSize
+	if bs <= 0 {
+		return 0
+	}
 	blocks := state.bitmap.blocks
 	n := len(blocks)
 	if n == 0 {
@@ -1182,7 +1189,55 @@ func (state *sessionState) progress() int64 {
 		mask = (uint64(1) << valid) - 1
 	}
 	set += int64(bits.OnesCount64(atomic.LoadUint64(&blocks[n-1]) & mask))
-	return set * state.blockSize
+
+	bytes := set * bs
+	// The trailing block may be shorter than bs; if it is set, its contribution
+	// is tail, not a full block.
+	if tail := state.meta.ExpectedSize % bs; tail != 0 {
+		last := state.bitmap.blockCount - 1
+		word := last / 64
+		bit := last % 64
+		if atomic.LoadUint64(&blocks[word])&(1<<bit) != 0 {
+			bytes = bytes - bs + tail
+		}
+	}
+	return bytes
+}
+
+// blockCountFor returns the number of block-size slots needed to cover size
+// bytes, rounding up to accommodate a trailing partial block.
+func blockCountFor(size, bs int64) int64 {
+	if bs <= 0 {
+		return 0
+	}
+	nb := size / bs
+	if size%bs != 0 {
+		nb++
+	}
+	return nb
+}
+
+// blockEndBoundary returns the byte offset where block `i` ends (i*bs), clamped
+// to the expected file size so a trailing partial block is not overreported.
+func blockEndBoundary(i, bs, expectedSize int64) int64 {
+	end := i * bs
+	if end > expectedSize {
+		end = expectedSize
+	}
+	return end
+}
+
+// validBlockChunk reports whether a chunk of size bytes starting at offset is
+// acceptable in block‑aligned mode: it must be an exact whole number of blocks,
+// or a single trailing chunk whose end coincides exactly with the expected file
+// size (the final block may be shorter than BlockSize). offset is expected to be
+// block‑aligned (checked by the caller).
+func (state *sessionState) validBlockChunk(offset, size int64) bool {
+	bs := state.blockSize
+	if size%bs == 0 {
+		return offset+size <= state.meta.ExpectedSize
+	}
+	return offset%bs == 0 && offset+size == state.meta.ExpectedSize
 }
 
 // verifyFileChecksum reads the entire file from current offset, calculates its

@@ -292,10 +292,21 @@ func TestBegin_Validation(t *testing.T) {
 		t.Fatal("expected error for BlockSize without ExpectedSize")
 	}
 
-	// ExpectedSize not multiple of BlockSize
-	_, err = m.Begin(ctx, "ns", "key", BeginOptions{BlockSize: 1024, ExpectedSize: 1500})
+	// ExpectedSize not multiple of BlockSize is allowed without piece hashes
+	sess, err := m.Begin(ctx, "ns", "key", BeginOptions{BlockSize: 1024, ExpectedSize: 1500})
+	if err != nil {
+		t.Fatalf("ExpectedSize not a multiple of BlockSize should be accepted without piece hashes: %v", err)
+	}
+	m.Abort(sess.ID)
+
+	// ... but rejected when piece hashes require uniform blocks
+	_, err = m.Begin(ctx, "ns", "key", BeginOptions{
+		BlockSize:    1024,
+		ExpectedSize: 1500,
+		PieceHashes:  []string{"abc"},
+	})
 	if err == nil {
-		t.Fatal("expected error for ExpectedSize not multiple of BlockSize")
+		t.Fatal("expected error for ExpectedSize not multiple of BlockSize with PieceHashes")
 	}
 
 	// Wrong piece count
@@ -627,6 +638,148 @@ func TestWriteChunk_Aligned_PieceHashMismatch(t *testing.T) {
 	_, err := m.WriteChunk(ctx, sess.ID, 0, bytes.NewReader(chunk), "")
 	if !errors.Is(err, ErrPieceHashMismatch) {
 		t.Fatalf("expected ErrPieceHashMismatch, got %v", err)
+	}
+}
+
+func TestWriteChunk_Aligned_TrailingPartialBlock_SingleChunk(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	const blockSize = 64
+	const total = blockSize*2 + 13 // 2 full blocks + a 13-byte tail
+	sess, err := m.Begin(ctx, "ns", "key", BeginOptions{
+		ExpectedSize: total,
+		BlockSize:    blockSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A single chunk that is not block-aligned but ends exactly at the file
+	// size is accepted (the final block is partial).
+	data := make([]byte, total)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	o, err := m.Offset(sess.ID)
+	if err != nil || o != 0 {
+		t.Fatalf("initial offset: got %d, err %v", o, err)
+	}
+	totalGot, err := m.WriteChunk(ctx, sess.ID, 0, bytes.NewReader(data), "")
+	if err != nil {
+		t.Fatalf("trailing partial chunk should be accepted: %v", err)
+	}
+	if totalGot != int64(total) {
+		t.Errorf("offset after write: got %d, want %d", totalGot, total)
+	}
+
+	rs, err := m.Ranges(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rs.IsComplete(int64(total)) {
+		t.Fatalf("ranges should cover full file, got %v", rs)
+	}
+
+	cu, err := m.Complete(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	defer cu.Close()
+	if cu.Size != int64(total) {
+		t.Errorf("completed size: got %d, want %d", cu.Size, total)
+	}
+}
+
+func TestWriteChunk_Aligned_TrailingPartialBlock_SeparateChunks(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	const blockSize = 64
+	const tail = 13
+	total := blockSize*2 + tail
+	sess, err := m.Begin(ctx, "ns", "key", BeginOptions{
+		ExpectedSize: int64(total),
+		BlockSize:    blockSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload the two full blocks and the trailing partial separately.
+	for i := 0; i < 2; i++ {
+		chunk := make([]byte, blockSize)
+		for j := range chunk {
+			chunk[j] = byte(i*blockSize + j)
+		}
+		if _, err := m.WriteChunk(ctx, sess.ID, int64(i*blockSize), bytes.NewReader(chunk), ""); err != nil {
+			t.Fatalf("full block %d: %v", i, err)
+		}
+	}
+	tailChunk := make([]byte, tail)
+	for j := range tailChunk {
+		tailChunk[j] = byte(2*blockSize + j)
+	}
+	if _, err := m.WriteChunk(ctx, sess.ID, int64(2*blockSize), bytes.NewReader(tailChunk), ""); err != nil {
+		t.Fatalf("trailing partial block: %v", err)
+	}
+
+	rs, err := m.Ranges(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs) != 1 || rs[0] != (ByteRange{0, int64(total)}) {
+		t.Fatalf("expected single full range, got %v", rs)
+	}
+
+	off, err := m.Offset(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != int64(total) {
+		t.Errorf("offset = %d, want %d", off, total)
+	}
+
+	cu, err := m.Complete(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	defer cu.Close()
+}
+
+func TestWriteChunk_Aligned_PartialChunkNotAtEOF_Rejected(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	const blockSize = 64
+	sess, _ := m.Begin(ctx, "ns", "key", BeginOptions{
+		ExpectedSize: blockSize * 2,
+		BlockSize:    blockSize,
+	})
+
+	// A non-aligned chunk in the middle of the file (not ending at EOF) must
+	// still be rejected.
+	chunk := make([]byte, blockSize+1)
+	if _, err := m.WriteChunk(ctx, sess.ID, 0, bytes.NewReader(chunk), ""); !errors.Is(err, ErrBlockAlignment) {
+		t.Fatalf("expected ErrBlockAlignment, got %v", err)
+	}
+}
+
+func TestBegin_NonMultipleSize_NeedsCompleteTail(t *testing.T) {
+	// A trailing partial chunk that does not sum to the full expected size
+	// must not produce a complete upload.
+	m := newTestManager(t)
+	ctx := context.Background()
+	const blockSize = 64
+	total := blockSize*2 + 13
+	sess, _ := m.Begin(ctx, "ns", "key", BeginOptions{
+		ExpectedSize: int64(total),
+		BlockSize:    blockSize,
+	})
+	// Upload only the first full block.
+	chunk := make([]byte, blockSize)
+	if _, err := m.WriteChunk(ctx, sess.ID, 0, bytes.NewReader(chunk), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Complete(ctx, sess.ID); !errors.Is(err, ErrIncompleteUpload) {
+		t.Fatalf("expected ErrIncompleteUpload, got %v", err)
 	}
 }
 

@@ -7,17 +7,27 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/asaidimu/blobs/index"
+	"github.com/asaidimu/blobs/object"
 	"github.com/asaidimu/blobs/staging"
+	"github.com/asaidimu/blobs/store"
 	"github.com/valyala/fasthttp"
 )
 
-var mgr *staging.Manager
+var (
+	mgr       *staging.Manager
+	blobStore *store.Store
+	ns        *store.NamespaceHandle
+)
+
+// storeNamespace is the single namespace uploaded files live under. Chosen
+// to match the "default" bucket name the staging manager was already using.
+const storeNamespace = "default"
 
 // fasthttp treats MaxRequestBodySize<=0 as "use the 4MB DefaultMaxRequestBodySize",
 // NOT as "unlimited". Since chunk sizes here can reach 8MB (see GOOD_BLOCK_SIZE in
@@ -34,9 +44,32 @@ func main() {
 	stopReaper := mgr.StartReaper(5*time.Minute, 1*time.Hour)
 	defer stopReaper()
 
-	if err := os.MkdirAll("./uploads", 0755); err != nil {
-		log.Fatalf("failed to create uploads dir: %v", err)
+	// NOTE: index.NewMemoryBackend() is what the store package's own doc
+	// comment uses as a placeholder ("swap for bbolt, badger, etc."). It is
+	// NOT persisted across restarts -- only the segment files under
+	// blobDataDir survive a restart, and with an in-memory index every blob
+	// they contain becomes invisible again until RebuildIndex is run. Swap
+	// this for a real persistent index.Backend before relying on this in
+	// production.
+	blobStore, err = store.Open(store.Config{
+		DataDir: "./blob_data",
+		Index:   index.NewMemoryBackend(),
+	})
+	if err != nil {
+		log.Fatalf("failed to open blob store: %v", err)
 	}
+	defer blobStore.Close()
+
+	bgCtx := context.Background()
+	if _, err := blobStore.GetNamespace(bgCtx, storeNamespace); err != nil {
+		if !index.IsNotFound(err) {
+			log.Fatalf("failed to check blob store namespace: %v", err)
+		}
+		if err := blobStore.CreateNamespace(bgCtx, object.Namespace{ID: storeNamespace}); err != nil {
+			log.Fatalf("failed to create blob store namespace: %v", err)
+		}
+	}
+	ns = blobStore.Namespace(storeNamespace)
 
 	server := &fasthttp.Server{
 		Handler:            requestHandler,
@@ -113,29 +146,33 @@ func sanitizeFilename(name string) (string, error) {
 	return base, nil
 }
 
-// uniqueFinalPath returns a path under dir for name that doesn't already
-// exist, appending " (1)", " (2)", etc. before the extension if needed.
-// This mirrors how Drive/Proton avoid silently clobbering an existing file
-// when multiple uploads share a name.
-func uniqueFinalPath(dir, name string) (string, error) {
-	candidate := filepath.Join(dir, name)
-	if _, err := os.Stat(candidate); os.IsNotExist(err) {
-		return candidate, nil
-	} else if err != nil {
+// uniqueStoreKey returns a key for name that doesn't already exist in the
+// store's namespace, appending " (1)", " (2)", etc. before the extension if
+// needed -- the same collision-avoidance uniqueFinalPath used to do against
+// the filesystem, done here against the store instead so two uploads with
+// the same filename don't silently overwrite each other (Put's own
+// semantics: "if key already exists, its ref is updated to point at the
+// new blob").
+func uniqueStoreKey(ctx context.Context, name string) (string, error) {
+	if _, err := ns.Head(ctx, name); err != nil {
+		if index.IsNotFound(err) {
+			return name, nil
+		}
 		return "", err
 	}
 
 	ext := filepath.Ext(name)
 	base := strings.TrimSuffix(name, ext)
 	for i := 1; i < 10000; i++ {
-		candidate = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", base, i, ext))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate, nil
-		} else if err != nil {
+		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+		if _, err := ns.Head(ctx, candidate); err != nil {
+			if index.IsNotFound(err) {
+				return candidate, nil
+			}
 			return "", err
 		}
 	}
-	return "", errors.New("could not find a unique filename")
+	return "", errors.New("could not find a unique storage key")
 }
 
 func serveHTML(ctx *fasthttp.RequestCtx) {
@@ -172,16 +209,8 @@ func handleBegin(ctx *fasthttp.RequestCtx) {
 	}
 
 	blockSize := req.BlockSize
-	if blockSize > 0 && req.Size > 0 && req.Size%blockSize != 0 {
-		suggested := blockSize
-		for suggested > 0 && req.Size%suggested != 0 {
-			suggested--
-		}
-		writeJSON(ctx, fasthttp.StatusBadRequest, map[string]interface{}{
-			"error":     "BlockSize must divide file size evenly",
-			"suggested": suggested,
-			"file_size": req.Size,
-		})
+	if blockSize < 0 || blockSize > req.Size {
+		writeError(ctx, fasthttp.StatusBadRequest, "blockSize must be between 0 and the file size")
 		return
 	}
 
@@ -240,55 +269,38 @@ func handleComplete(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	cu, err := mgr.Complete(context.Background(), sessionID)
+	bgCtx := context.Background()
+
+	cu, err := mgr.Complete(bgCtx, sessionID)
 	if err != nil {
 		writeError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
 	defer cu.Close()
 
-	finalDir, err := filepath.Abs("./uploads")
+	key, err := uniqueStoreKey(bgCtx, cu.Key)
 	if err != nil {
-		writeError(ctx, fasthttp.StatusInternalServerError, "failed resolving uploads dir")
+		writeError(ctx, fasthttp.StatusInternalServerError, "failed choosing storage key")
 		return
 	}
 
-	finalPath, err := uniqueFinalPath(finalDir, cu.Key)
+	// cu already satisfies io.Reader (see the staging package), so Put
+	// streams it straight into the blob store's chunking/hashing pipeline
+	// in a single pass -- no intermediate file, no os.Rename, no fallback
+	// copy loop, and no plain "./uploads" directory at all. ContentType is
+	// left empty so the store sniffs it itself.
+	info, err := ns.Put(bgCtx, key, cu, store.PutOptions{})
 	if err != nil {
-		writeError(ctx, fasthttp.StatusInternalServerError, "failed choosing output filename")
+		writeError(ctx, fasthttp.StatusInternalServerError, "failed storing blob: "+err.Error())
 		return
 	}
-
-	stagedPath := cu.File().Name()
-
-	if renameErr := os.Rename(stagedPath, finalPath); renameErr != nil {
-		// Cross-device (or otherwise non-renameable) staging dir: fall back to a copy.
-		out, createErr := os.Create(finalPath)
-		if createErr != nil {
-			writeError(ctx, fasthttp.StatusInternalServerError, "failed creating output file")
-			return
-		}
-
-		if _, copyErr := io.Copy(out, cu); copyErr != nil {
-			out.Close()
-			os.Remove(finalPath)
-			writeError(ctx, fasthttp.StatusInternalServerError, "failed copying output file")
-			return
-		}
-		_ = out.Sync()
-		out.Close()
-
-		// os.Rename would have consumed the staged file; since we copied
-		// instead, the staged file is still sitting on disk and would leak
-		// otherwise.
-		_ = os.Remove(stagedPath)
-	}
-
 	cu.Finalize()
 
-	writeJSON(ctx, fasthttp.StatusOK, map[string]string{
-		"status": "ok",
-		"path":   finalPath,
+	writeJSON(ctx, fasthttp.StatusOK, map[string]interface{}{
+		"status":      "ok",
+		"key":         info.Key,
+		"size":        info.Metadata.Size,
+		"contentType": info.Metadata.ContentType,
 	})
 }
 
@@ -337,25 +349,18 @@ func handleAbort(ctx *fasthttp.RequestCtx) {
 }
 
 func handleListFiles(ctx *fasthttp.RequestCtx) {
-	entries, err := os.ReadDir("./uploads")
+	blobs, err := ns.List(context.Background(), store.ListOptions{})
 	if err != nil {
-		writeError(ctx, fasthttp.StatusInternalServerError, "failed reading uploads directory")
+		writeError(ctx, fasthttp.StatusInternalServerError, "failed listing stored files")
 		return
 	}
 
-	files := make([]fileInfoResponse, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
+	files := make([]fileInfoResponse, 0, len(blobs))
+	for _, b := range blobs {
 		files = append(files, fileInfoResponse{
-			Name:    e.Name(),
-			Size:    info.Size(),
-			ModTime: info.ModTime().Format(time.RFC3339),
+			Name:    b.Key,
+			Size:    b.Metadata.Size,
+			ModTime: b.Metadata.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -370,13 +375,38 @@ func handleDownload(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	filePath := filepath.Join("./uploads", cleanName)
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		writeError(ctx, fasthttp.StatusNotFound, "file not found")
+	bgCtx := context.Background()
+
+	info, err := ns.Head(bgCtx, cleanName)
+	if err != nil {
+		if index.IsNotFound(err) {
+			writeError(ctx, fasthttp.StatusNotFound, "file not found")
+			return
+		}
+		writeError(ctx, fasthttp.StatusInternalServerError, err.Error())
 		return
 	}
 
-	fasthttp.ServeFile(ctx, filePath)
+	rc, err := ns.Get(bgCtx, cleanName)
+	if err != nil {
+		if index.IsNotFound(err) {
+			writeError(ctx, fasthttp.StatusNotFound, "file not found")
+			return
+		}
+		writeError(ctx, fasthttp.StatusInternalServerError, err.Error())
+		return
+	}
+
+	contentType := info.Metadata.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	ctx.SetContentType(contentType)
+	ctx.Response.Header.Set("Content-Disposition", "attachment; filename=\""+cleanName+"\"")
+	// fasthttp closes rc for us once the streamed body has been written in
+	// full, since it implements io.Closer -- same contract os.File already
+	// satisfied when ServeFile was used here before.
+	ctx.SetBodyStream(rc, int(info.Metadata.Size))
 }
 
 func handleDelete(ctx *fasthttp.RequestCtx) {
@@ -387,8 +417,7 @@ func handleDelete(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	filePath := filepath.Join("./uploads", cleanName)
-	if err := os.Remove(filePath); err != nil {
+	if err := ns.Delete(context.Background(), cleanName); err != nil {
 		writeError(ctx, fasthttp.StatusInternalServerError, "failed deleting file")
 		return
 	}
@@ -883,6 +912,7 @@ const indexHTML = `<!DOCTYPE html>
     const MAX_RETRIES = 3;
     const RETRY_DELAY_MS = 1500;
     const MAX_CONCURRENT_JOBS = 3;
+    const RENDER_THROTTLE_MS = 80;
 
     // ── Icons ────────────────────────────────────────────────────────────────
     const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
@@ -1032,11 +1062,14 @@ const indexHTML = `<!DOCTYPE html>
     }
 
     function chooseBlockSize(fileSize, preferred) {
-        if (fileSize === 0) return 0;
-        for (let b = preferred; b > 0; b--) {
-            if (fileSize % b === 0) return b;
-        }
-        return 1;
+        // No requirement that blockSize evenly divide fileSize: every chunk
+        // except the last is exactly blockSize, and the last is whatever
+        // remains. Searching for an exact divisor here used to mean up to
+        // "preferred" synchronous modulo checks (millions, for an 8MB
+        // preference) with zero yielding -- a guaranteed tab freeze on any
+        // file size that isn't a clean power of two.
+        if (fileSize <= 0) return 0;
+        return Math.min(preferred, fileSize);
     }
 
     function getMissingRanges(ranges, fileSize) {
@@ -1204,6 +1237,8 @@ const indexHTML = `<!DOCTYPE html>
 
         log('Pre-hashing ' + totalBlocks + ' block(s) for "' + job.name + '"...');
 
+        let lastYield = performance.now();
+
         for (let i = 0; i < totalBlocks; i++) {
             if (job.cancelRequested) throw new Error('Pre-hashing cancelled');
             while (job.pauseRequested && !job.cancelRequested) await sleep(200);
@@ -1219,9 +1254,17 @@ const indexHTML = `<!DOCTYPE html>
             cumulativeHashes.push(blockHash);
 
             job.hashProgress = Math.round(((i + 1) / totalBlocks) * 100);
-            renderJob(job);
+            if (i === totalBlocks - 1) {
+                renderJob(job);
+            } else {
+                renderJobThrottled(job, RENDER_THROTTLE_MS);
+            }
 
-            if (i % 10 === 0) await new Promise(r => setTimeout(r, 0));
+            const now = performance.now();
+            if (now - lastYield > 12) {
+                await sleep(0);
+                lastYield = performance.now();
+            }
         }
 
         const concatenated = cumulativeHashes.join('');
@@ -1262,7 +1305,7 @@ const indexHTML = `<!DOCTYPE html>
             job.lastProgressBytes = serverTotal;
         }
 
-        renderJob(job);
+        renderJobThrottled(job, RENDER_THROTTLE_MS);
     }
 
     async function uploadOneChunk(job, range) {
@@ -1702,6 +1745,22 @@ const indexHTML = `<!DOCTYPE html>
         btnCancel.title = (job.status === 'completed' || job.status === 'cancelled') ? 'Remove' : 'Cancel';
 
         updateSummary();
+    }
+
+    // renderJob() walks the DOM for this row and recomputes the whole queue
+    // summary. That's fine at the rate chunks normally complete, but a
+    // pre-hash or upload loop over thousands of small blocks calling it
+    // unconditionally per-block is a real CPU sink (forced style/layout
+    // recalculation thousands of times back to back). Throttle it to a
+    // fixed cadence for high-frequency callers; callers that need an
+    // immediate, un-throttled update (status transitions, completion) should
+    // keep calling renderJob(job) directly.
+    function renderJobThrottled(job, minIntervalMs) {
+        const now = performance.now();
+        if (!job._lastRenderAt || now - job._lastRenderAt >= minIntervalMs) {
+            job._lastRenderAt = now;
+            renderJob(job);
+        }
     }
 
     function removeJobRow(id) {
