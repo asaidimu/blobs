@@ -373,6 +373,15 @@ func putStatsTx(tx Tx, stats object.NamespaceStats) error {
 	return tx.Put(keyStats(stats.NamespaceID), v)
 }
 
+// PutStats persists the given namespace stats, overwriting any previous value.
+func (idx *Index) PutStats(ctx context.Context, stats object.NamespaceStats) error {
+	v, err := marshal(stats)
+	if err != nil {
+		return err
+	}
+	return idx.b.Put(ctx, keyStats(stats.NamespaceID), v)
+}
+
 // ── Atomic write paths ────────────────────────────────────────────────────────
 
 // CommitPut atomically writes a new blob to the index and updates stats.

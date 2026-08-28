@@ -15,8 +15,8 @@ import (
 // This is the foundation of deduplication and idempotent replication.
 type BlobID string
 
-func (id BlobID) String() string  { return string(id) }
-func (id BlobID) IsZero() bool    { return id == "" }
+func (id BlobID) String() string { return string(id) }
+func (id BlobID) IsZero() bool   { return id == "" }
 
 // ChunkID uniquely identifies a chunk within the volume engine.
 //
@@ -111,7 +111,7 @@ type RefEntry struct {
 // RefCount tracks how many RefEntries point here; zero means GC-eligible.
 type BlobEntry struct {
 	BlobID    BlobID    `json:"blob_id"`
-	ChunkIDs  []ChunkID `json:"chunk_ids"`  // ordered; reassemble in this order
+	ChunkIDs  []ChunkID `json:"chunk_ids"` // ordered; reassemble in this order
 	TotalSize int64     `json:"total_size"`
 	RefCount  int64     `json:"ref_count"`
 	CreatedAt time.Time `json:"created_at"`
@@ -128,6 +128,19 @@ type ChunkEntry struct {
 	Length      int64     `json:"length"`      // payload byte length (excludes page headers/padding)
 	Seq         int       `json:"seq"`         // 0-based position within the blob
 	RefCount    int64     `json:"ref_count"`   // blobs referencing this content; zero means GC-eligible
+
+	// Nonce and Tag are set only when this chunk's namespace has
+	// encryption enabled (see Namespace.Encryption); both are nil for
+	// every chunk in an unencrypted namespace. Nonce is the 12-byte GCM
+	// nonce and Tag the 16-byte detached GCM authentication tag used by
+	// package encryption to encrypt/decrypt this chunk's payload. The
+	// payload bytes on disk are ciphertext of exactly Length bytes —
+	// nonce and tag are carried here, in the index, rather than inline
+	// in the page, specifically so the volume/segment format and
+	// compaction's byte-level segment rewrite never need to change or
+	// even be aware encryption exists.
+	Nonce []byte `json:"nonce,omitempty"`
+	Tag   []byte `json:"tag,omitempty"`
 }
 
 // SegmentState describes the lifecycle of a segment file.
@@ -147,8 +160,8 @@ type SegmentEntry struct {
 	State       SegmentState `json:"state"`
 	PageSize    int          `json:"page_size"`
 	PageCount   int64        `json:"page_count"`
-	BytesUsed   int64        `json:"bytes_used"`   // live payload bytes
-	BytesTotal  int64        `json:"bytes_total"`  // total file size
+	BytesUsed   int64        `json:"bytes_used"`  // live payload bytes
+	BytesTotal  int64        `json:"bytes_total"` // total file size
 	CreatedAt   time.Time    `json:"created_at"`
 	SealedAt    *time.Time   `json:"sealed_at,omitempty"`
 }
@@ -162,6 +175,37 @@ type Namespace struct {
 	CreatedAt   time.Time         `json:"created_at"`
 	Quota       *Quota            `json:"quota,omitempty"` // nil = unlimited
 	Custom      map[string]string `json:"custom,omitempty"`
+
+	// Encryption describes this namespace's encryption-at-rest state.
+	// Nil (the default) means the namespace is unencrypted. This is
+	// decided once, at namespace creation, and is not meant to change
+	// afterward — see package encryption's doc comment for why turning
+	// it on later does not retroactively encrypt already-written data.
+	Encryption *EncryptionInfo `json:"encryption,omitempty"`
+}
+
+// EncryptionInfo records that a namespace has encryption-at-rest enabled
+// and holds what's needed to recover its data-encryption key (DEK). The
+// DEK itself is never stored — only WrappedDEK, the DEK encrypted
+// (envelope encryption) under a caller-supplied master key.
+type EncryptionInfo struct {
+	// Enabled is always true when Namespace.Encryption is non-nil; kept
+	// as an explicit field (rather than relying on the pointer alone)
+	// so a future schema revision can distinguish "encryption turned
+	// off" from "record predates this field" without an ambiguous zero
+	// value.
+	Enabled bool `json:"enabled"`
+
+	// WrappedDEK is this namespace's DEK, encrypted under a master key
+	// (see package encryption's WrapKey/UnwrapKey). The store never
+	// persists a DEK in the clear.
+	WrappedDEK []byte `json:"wrapped_dek"`
+
+	// KeyVersion identifies which master key WrappedDEK was wrapped
+	// under. Opaque to this package — it exists purely so a caller
+	// holding multiple master keys (e.g. across a rotation) can look up
+	// the right one via encryption.KeyProvider.Key(KeyVersion).
+	KeyVersion string `json:"key_version,omitempty"`
 }
 
 // Quota defines resource limits for a namespace.
@@ -178,25 +222,25 @@ type Quota struct {
 // Maintained incrementally on every write/delete — never computed by scanning.
 type NamespaceStats struct {
 	NamespaceID   string    `json:"namespace_id"`
-	BlobCount     int64     `json:"blob_count"`      // live refs
-	BytesStored   int64     `json:"bytes_stored"`    // logical bytes (sum of blob sizes)
-	BytesPhysical int64     `json:"bytes_physical"`  // actual bytes on disk (after dedup)
-	ChunkCount    int64     `json:"chunk_count"`     // live chunks
-	DeadBytes     int64     `json:"dead_bytes"`      // unreferenced bytes awaiting compaction
-	DeadChunks    int64     `json:"dead_chunks"`     // unreferenced chunks awaiting compaction
+	BlobCount     int64     `json:"blob_count"`     // live refs
+	BytesStored   int64     `json:"bytes_stored"`   // logical bytes (sum of blob sizes)
+	BytesPhysical int64     `json:"bytes_physical"` // actual bytes on disk (after dedup)
+	ChunkCount    int64     `json:"chunk_count"`    // live chunks
+	DeadBytes     int64     `json:"dead_bytes"`     // unreferenced bytes awaiting compaction
+	DeadChunks    int64     `json:"dead_chunks"`    // unreferenced chunks awaiting compaction
 	SegmentCount  int64     `json:"segment_count"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // StoreStats aggregates metrics across all namespaces.
 type StoreStats struct {
-	NamespaceCount     int64           `json:"namespace_count"`
-	TotalBlobCount     int64           `json:"total_blob_count"`
-	TotalBytesStored   int64           `json:"total_bytes_stored"`
-	TotalBytesPhysical int64           `json:"total_bytes_physical"`
-	TotalDeadBytes     int64           `json:"total_dead_bytes"`
-	SegmentCount       int64           `json:"segment_count"`
-	DeduplicationRatio float64         `json:"deduplication_ratio"` // >1 means dedup is saving space
+	NamespaceCount     int64            `json:"namespace_count"`
+	TotalBlobCount     int64            `json:"total_blob_count"`
+	TotalBytesStored   int64            `json:"total_bytes_stored"`
+	TotalBytesPhysical int64            `json:"total_bytes_physical"`
+	TotalDeadBytes     int64            `json:"total_dead_bytes"`
+	SegmentCount       int64            `json:"segment_count"`
+	DeduplicationRatio float64          `json:"deduplication_ratio"` // >1 means dedup is saving space
 	PerNamespace       []NamespaceStats `json:"per_namespace"`
 	ComputedAt         time.Time        `json:"computed_at"`
 }

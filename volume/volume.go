@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/asaidimu/blobs/chunking"
+	"github.com/asaidimu/blobs/encryption"
 	"github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/object"
 )
@@ -250,6 +251,19 @@ type Options struct {
 	PageSize       int
 	ChunkSize      int64
 	MaxSegmentSize int64
+
+	// Cipher, if non-nil, enables encryption-at-rest for every chunk
+	// this Engine writes and reads: WriteBlob encrypts each chunk's
+	// payload before it reaches disk, and ReadChunk decrypts it after
+	// reading and CRC-verifying the stored bytes. Nil (the default)
+	// means the namespace is unencrypted — Engine's on-disk behavior is
+	// then identical to before this option existed.
+	//
+	// This is deliberately an Engine-level (i.e. per-namespace) switch,
+	// not a global one: package store resolves each namespace's own
+	// Cipher independently, from that namespace's own key, so
+	// encryption is opt-in per namespace.
+	Cipher *encryption.Cipher
 }
 
 func (o Options) withDefaults() Options {
@@ -371,7 +385,7 @@ func putPageBuf(b []byte) {
 	}
 }
 
-func getHasher() hash.Hash { h := hasherPool.Get().(hash.Hash); h.Reset(); return h }
+func getHasher() hash.Hash  { h := hasherPool.Get().(hash.Hash); h.Reset(); return h }
 func putHasher(h hash.Hash) { hasherPool.Put(h) }
 
 func getWALBuf() *[]byte  { return walBufPool.Get().(*[]byte) }
@@ -394,8 +408,8 @@ type WriteResult struct {
 //   - mu + 40-byte explicit pad = exactly 64 bytes (one cache line).
 //     Prevents false sharing with active/nextSeq which change per write.
 type Engine struct {
-	mu  sync.RWMutex
-	_   [40]byte // pad to 64-byte cache line (RWMutex=24b, pad=40b)
+	mu sync.RWMutex
+	_  [40]byte // pad to 64-byte cache line (RWMutex=24b, pad=40b)
 
 	active  *segFile
 	nextSeq uint64
@@ -494,10 +508,31 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 		n := len(payload)
 		total += int64(n)
 
-		// Hash and CRC computed outside the lock.
+		// Hash computed on plaintext, outside the lock — content
+		// addressing (ChunkID/BlobID) and cross-blob dedup must always
+		// key off the plaintext, encryption or not, or identical
+		// content would stop deduplicating.
 		blobHasher.Write(payload)
 		chunkHashArr := sha256.Sum256(payload)
-		crc := crc32.ChecksumIEEE(payload)
+		chunkID := chunkIDFromContent(chunkHashArr)
+
+		// stored is what actually gets written to the page: the
+		// plaintext payload, unless this namespace has encryption
+		// enabled, in which case it's payload's ciphertext — always
+		// exactly len(payload) bytes either way (see package
+		// encryption's doc comment for why that length-preservation is
+		// the property that keeps everything below this point, and all
+		// of compaction, unaware encryption exists at all).
+		stored := payload
+		var nonce, tag []byte
+		if e.opts.Cipher != nil {
+			var err error
+			nonce, stored, tag, err = e.opts.Cipher.Seal([]byte(chunkID), payload)
+			if err != nil {
+				return nil, fmt.Errorf("volume: encrypt chunk seq %d: %w", chunkSeq, err)
+			}
+		}
+		crc := crc32.ChecksumIEEE(stored)
 
 		// Lock only for the segment write.
 		e.mu.Lock()
@@ -511,14 +546,14 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 		}
 
 		hdr := pageHeader{
-			DataLen:    uint64(n),
+			DataLen:    uint64(len(stored)),
 			ChunkID:    chunkHashArr,
 			ChunkSeq:   uint32(chunkSeq),
 			CRC32:      crc,
 			MagicFlags: encodeMagicFlags(0), // BlobID, TotalChunks, Flags patched below
 		}
 
-		pageOffset, pageCount, err := e.active.appendChunk(hdr, payload, e.opts.PageSize)
+		pageOffset, pageCount, err := e.active.appendChunk(hdr, stored, e.opts.PageSize)
 		segSeq := e.active.seq
 		e.mu.Unlock()
 
@@ -527,13 +562,15 @@ func (e *Engine) WriteBlob(r io.Reader) (*WriteResult, error) {
 		}
 
 		chunks = append(chunks, object.ChunkEntry{
-			ChunkID:     chunkIDFromContent(chunkHashArr),
+			ChunkID:     chunkID,
 			SegmentID:   object.SegmentID(segSeq),
 			NamespaceID: e.nsID,
 			PageOffset:  pageOffset,
 			PageCount:   pageCount,
 			Length:      int64(n),
 			Seq:         chunkSeq,
+			Nonce:       nonce,
+			Tag:         tag,
 		})
 		patches = append(patches, patchTarget{segSeq, pageOffset})
 		chunkSeq++
@@ -661,7 +698,25 @@ func (e *Engine) ReadChunk(entry object.ChunkEntry) ([]byte, error) {
 			Detail:    fmt.Sprintf("CRC mismatch for chunk %s", entry.ChunkID),
 		}
 	}
-	return data, nil
+
+	if e.opts.Cipher == nil {
+		return data, nil
+	}
+	if len(entry.Nonce) == 0 || len(entry.Tag) == 0 {
+		return nil, fmt.Errorf(
+			"volume: chunk %s: namespace %q is encrypted but this chunk's index record has no nonce/tag (written before encryption was enabled, or index corruption)",
+			entry.ChunkID, e.nsID,
+		)
+	}
+	plaintext, err := e.opts.Cipher.Open([]byte(entry.ChunkID), entry.Nonce, data, entry.Tag)
+	if err != nil {
+		return nil, &errors.CorruptionError{
+			SegmentID: entry.SegmentID.String(),
+			Offset:    entry.PageOffset,
+			Detail:    fmt.Sprintf("decrypt chunk %s: %v", entry.ChunkID, err),
+		}
+	}
+	return plaintext, nil
 }
 
 // MarkDeleted sets the deleted flag via ReadAt + WriteAt on the magicFlags word.
@@ -1348,9 +1403,9 @@ func (e *Engine) scanSegFile(path string, seq uint64, fn func(object.ChunkEntry,
 // os.OpenFile + syscall.ByteSliceFromString allocation that occurred on every
 // blob write when we opened the WAL by path each time.
 type segFile struct {
-	f      *os.File       // segment data file
-	bw     *bufio.Writer  // buffered writer over f
-	wal    *os.File       // WAL file — kept open for the segment's lifetime
+	f      *os.File      // segment data file
+	bw     *bufio.Writer // buffered writer over f
+	wal    *os.File      // WAL file — kept open for the segment's lifetime
 	seq    uint64
 	offset int64
 }

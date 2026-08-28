@@ -32,6 +32,7 @@ import (
 
 	"github.com/gabriel-vasile/mimetype"
 
+	"github.com/asaidimu/blobs/encryption"
 	bserrors "github.com/asaidimu/blobs/errors"
 	"github.com/asaidimu/blobs/index"
 	"github.com/asaidimu/blobs/object"
@@ -57,6 +58,14 @@ type Config struct {
 	PageSize       int
 	ChunkSize      int64
 	MaxSegmentSize int64
+
+	// KeyProvider supplies the master key(s) used to wrap and unwrap
+	// per-namespace data-encryption keys (see package encryption).
+	// Required only if any namespace is created with
+	// WithEncryption() — a store that never uses encryption can leave
+	// this nil. The store never generates, stores, or has any opinion
+	// about where the master key comes from.
+	KeyProvider encryption.KeyProvider
 }
 
 // ── Options for individual operations ────────────────────────────────────────
@@ -204,11 +213,38 @@ func (s *Store) Close() error {
 
 // ── Namespace management ──────────────────────────────────────────────────────
 
+// CreateNamespaceOption configures optional behavior for CreateNamespace.
+type CreateNamespaceOption func(*createNamespaceConfig)
+
+type createNamespaceConfig struct {
+	encrypt bool
+}
+
+// WithEncryption enables encryption-at-rest for the namespace being
+// created. A random 256-bit data-encryption key (DEK) is generated for
+// this namespace and wrapped under the current master key from
+// Config.KeyProvider (which must therefore be non-nil), before being
+// persisted — the DEK itself is never stored in the clear.
+//
+// This is a one-time, per-namespace decision made here, at creation:
+// every chunk this namespace ever writes from this point on is
+// encrypted, and there is no supported way to flip it on for an
+// already-populated namespace after the fact (see package encryption's
+// doc comment).
+func WithEncryption() CreateNamespaceOption {
+	return func(c *createNamespaceConfig) { c.encrypt = true }
+}
+
 // CreateNamespace creates a new isolated partition within the store.
 // Returns *errors.AlreadyExistsError if nsID is already in use.
-func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace) error {
+func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace, opts ...CreateNamespaceOption) error {
 	if err := object.ValidateNamespaceID(ns.ID); err != nil {
 		return err
+	}
+
+	var cfg createNamespaceConfig
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	s.mu.Lock()
@@ -218,6 +254,29 @@ func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace) error 
 		return &bserrors.AlreadyExistsError{NamespaceID: ns.ID}
 	} else if !index.IsNotFound(err) {
 		return fmt.Errorf("store: check namespace: %w", err)
+	}
+
+	if cfg.encrypt {
+		if s.cfg.KeyProvider == nil {
+			return fmt.Errorf("store: WithEncryption requires Config.KeyProvider to be set")
+		}
+		dek, err := encryption.GenerateKey()
+		if err != nil {
+			return fmt.Errorf("store: generate namespace key: %w", err)
+		}
+		masterKey, version, err := s.cfg.KeyProvider.CurrentKey()
+		if err != nil {
+			return fmt.Errorf("store: get current master key: %w", err)
+		}
+		wrapped, err := encryption.WrapKey(masterKey, dek)
+		if err != nil {
+			return fmt.Errorf("store: wrap namespace key: %w", err)
+		}
+		ns.Encryption = &object.EncryptionInfo{
+			Enabled:    true,
+			WrappedDEK: wrapped,
+			KeyVersion: version,
+		}
 	}
 
 	ns.CreatedAt = time.Now().UTC()
@@ -341,10 +400,16 @@ func (s *Store) Stats(ctx context.Context) (*object.StoreStats, error) {
 // (ListSegmentIDs) and reads each segment's small WAL file, not a full
 // segment scan.
 func (s *Store) openEngine(ctx context.Context, nsID string) error {
+	cipher, err := s.resolveCipher(ctx, nsID)
+	if err != nil {
+		return err
+	}
+
 	eng, err := volume.Open(s.cfg.DataDir, nsID, volume.Options{
 		PageSize:       s.cfg.PageSize,
 		ChunkSize:      s.cfg.ChunkSize,
 		MaxSegmentSize: s.cfg.MaxSegmentSize,
+		Cipher:         cipher,
 	})
 	if err != nil {
 		return err
@@ -357,9 +422,62 @@ func (s *Store) openEngine(ctx context.Context, nsID string) error {
 	return nil
 }
 
+// resolveCipher returns the *encryption.Cipher for nsID's volume Engine,
+// or nil if nsID is unencrypted. For an encrypted namespace, it fetches
+// the namespace's persisted EncryptionInfo, asks Config.KeyProvider for
+// the master key that WrappedDEK was wrapped under (by KeyVersion), and
+// unwraps the DEK — the store never persists a DEK in the clear, so this
+// unwrap happens fresh every time the engine is opened (store startup or
+// namespace creation), not once and cached to disk.
+func (s *Store) resolveCipher(ctx context.Context, nsID string) (*encryption.Cipher, error) {
+	ns, err := s.idx.GetNamespace(ctx, nsID)
+	if err != nil {
+		return nil, fmt.Errorf("store: get namespace %q for engine open: %w", nsID, err)
+	}
+	if ns.Encryption == nil || !ns.Encryption.Enabled {
+		return nil, nil
+	}
+	if s.cfg.KeyProvider == nil {
+		return nil, fmt.Errorf("store: namespace %q is encrypted but Config.KeyProvider is not set", nsID)
+	}
+	masterKey, err := s.cfg.KeyProvider.Key(ns.Encryption.KeyVersion)
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve master key (version %q) for namespace %q: %w", ns.Encryption.KeyVersion, nsID, err)
+	}
+	dek, err := encryption.UnwrapKey(masterKey, ns.Encryption.WrappedDEK)
+	if err != nil {
+		return nil, fmt.Errorf("store: unwrap DEK for namespace %q: %w", nsID, err)
+	}
+	cipher, err := encryption.New(dek)
+	if err != nil {
+		return nil, fmt.Errorf("store: init cipher for namespace %q: %w", nsID, err)
+	}
+	return cipher, nil
+}
+
 // replayWAL parses every segment's WAL file for eng and registers any
 // not-yet-committed blob it finds. See openEngine's doc comment for the
 // full rationale.
+//
+// KNOWN LIMITATION for encrypted namespaces: the WAL's on-disk binary
+// format (see volume.appendWAL) predates this package's encryption
+// support and does not carry a chunk's Nonce/Tag — only ChunkID,
+// location, and length. A chunk replayed from the WAL here therefore
+// gets PutChunk'd with no Nonce/Tag, exactly like a chunk touched by
+// RebuildIndex — but unlike RebuildIndex, this path cannot simply
+// refuse, because it runs unconditionally on every Store.Open. In
+// practice this only matters for the narrow crash window WAL replay
+// exists to cover at all: a segment fsync and its WAL entry both
+// succeeded, but the process died before CommitPut ran. For an
+// encrypted namespace, a crash landing in exactly that window leaves
+// that blob's chunks durably on disk as ciphertext with no recoverable
+// key material — ReadChunk will fail them with the "no nonce/tag"
+// error at volume.Engine.ReadChunk, loudly rather than silently, but
+// they are not recoverable. Extending the WAL format to also carry
+// Nonce/Tag (versioned via segFileHeader.Version, to stay compatible
+// with WAL files written before this field existed) would close this
+// gap; it is intentionally left as a follow-up rather than done here
+// without a way to verify the on-disk format change end-to-end.
 func (s *Store) replayWAL(ctx context.Context, nsID string, eng *volume.Engine) error {
 	segIDs, err := eng.ListSegmentIDs()
 	if err != nil {
@@ -918,6 +1036,23 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 // re-links against the much worse alternative of silently deleting data
 // an operator is still in the middle of recovering.
 func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
+	// RebuildIndex reconstructs every ChunkEntry purely from what's
+	// physically recoverable from a page header (see the ScanSegments
+	// callback below) — and a chunk's Nonce/Tag are, by design (see
+	// package encryption's doc comment), stored only in the index, not
+	// in the page. For an unencrypted namespace that's irrelevant; for
+	// an encrypted one it means a rebuilt index would contain
+	// ciphertext-holding chunks with no way to ever decrypt them again
+	// — ReadChunk would fail every one of them. Refuse up front with a
+	// clear error instead of silently producing a permanently unreadable
+	// namespace.
+	if ns, err := h.store.idx.GetNamespace(ctx, h.nsID); err == nil && ns.Encryption != nil && ns.Encryption.Enabled {
+		return fmt.Errorf(
+			"store: RebuildIndex is not supported for encrypted namespace %q: per-chunk nonce/tag exist only in the index being rebuilt, not on disk, and cannot be recovered from a physical scan",
+			h.nsID,
+		)
+	}
+
 	eng, err := h.store.beginNSOp(h.nsID)
 	if err != nil {
 		return err
@@ -1089,7 +1224,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	defer h.store.endNSOp(h.nsID)
 
 	var (
-		deadChunks   []object.ChunkEntry   // physical pages to mark deleted
+		deadChunks   []object.ChunkEntry // physical pages to mark deleted
 		deadChunkIDs []object.ChunkID    // index records with RefCount == 0 to remove
 		bytesFreed   int64
 		chunksFreed  int64
@@ -1164,6 +1299,21 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		return CompactResult{}, fmt.Errorf("store: purge dead blobs: %w", err)
 	}
 
+	// Decrement the namespace stats so they reflect the reaped chunks and
+	// purged blobs. Without this the stats retain stale DeadBytes /
+	// DeadChunks / BlobCount counts long after the physical space has been
+	// reclaimed.
+	stats, err := h.store.idx.GetStats(ctx, h.nsID)
+	if err != nil {
+		return CompactResult{}, fmt.Errorf("store: compact: get stats: %w", err)
+	}
+	stats.DeadBytes -= bytesFreed
+	stats.DeadChunks -= int64(len(deadChunkIDs))
+	stats.BlobCount -= int64(blobsRemoved)
+	if err := h.store.idx.PutStats(ctx, *stats); err != nil {
+		return CompactResult{}, fmt.Errorf("store: compact: put stats: %w", err)
+	}
+
 	return CompactResult{
 		BlobsRemoved:  int64(blobsRemoved),
 		ChunksRemoved: chunksFreed,
@@ -1210,7 +1360,29 @@ func (h *NamespaceHandle) compactPhase2(ctx context.Context, threshold float64) 
 		// not — still resolves to valid data; the only cost of a crash
 		// mid-loop is that this segment's space isn't reclaimed yet, and
 		// the next Compact call simply retries it.
+		//
+		// RewriteSegment builds each relocated entry purely from the
+		// physical page header it copied — it has no index access, so
+		// fields that only ever live in the index (RefCount, and, for an
+		// encrypted namespace, Nonce/Tag) come back zero-valued on
+		// every relocated entry. Blindly PutChunk-ing those would zero
+		// out a still-live chunk's RefCount (making the next Compact
+		// phase 1 wrongly treat it as dead and delete it) and would
+		// permanently strip an encrypted chunk of the nonce/tag it
+		// needs to ever be decrypted again. Fetch each chunk's current
+		// record first and carry those fields forward — only the
+		// location fields (SegmentID/PageOffset/PageCount) actually
+		// change here.
 		for _, entry := range relocated {
+			existing, err := h.store.idx.GetChunk(ctx, entry.ChunkID)
+			if err != nil {
+				return bytesFreed, segmentsCompacted, fmt.Errorf(
+					"relocate chunk %s to segment %s: look up existing record: %w", entry.ChunkID, rewriteResult.NewSegmentID, err,
+				)
+			}
+			entry.RefCount = existing.RefCount
+			entry.Nonce = existing.Nonce
+			entry.Tag = existing.Tag
 			if err := h.store.idx.PutChunk(ctx, entry); err != nil {
 				return bytesFreed, segmentsCompacted, fmt.Errorf(
 					"relocate chunk %s to segment %s: %w", entry.ChunkID, rewriteResult.NewSegmentID, err,
@@ -1358,9 +1530,9 @@ func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) er
 type chunkReader struct {
 	engine      *volume.Engine
 	locations   []object.ChunkEntry
-	totalSize   int64 // sum of every location's Length, computed once at construction
-	idx         int   // next chunk to load
-	pendingSkip int64 // bytes to discard from the next-loaded chunk; set by Seek, consumed once
+	totalSize   int64  // sum of every location's Length, computed once at construction
+	idx         int    // next chunk to load
+	pendingSkip int64  // bytes to discard from the next-loaded chunk; set by Seek, consumed once
 	buf         []byte // current chunk payload
 	pos         int    // read position within buf
 	absPos      int64  // absolute stream position, for Seek's SeekCurrent/SeekEnd math
