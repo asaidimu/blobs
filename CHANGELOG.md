@@ -1,3 +1,12 @@
+## [1.3.2](https://github.com/asaidimu/blobs/compare/v1.3.1...v1.3.2) (2026-08-29)
+
+
+### Bug Fixes
+
+* fix dependencies ([79505a8](https://github.com/asaidimu/blobs/commit/79505a83902e24e5997026d6e2cf4eb2026fc60b))
+* **index:** prevent scan operation on closed MemoryBackend ([f5a7c1e](https://github.com/asaidimu/blobs/commit/f5a7c1e51756bc6702891a05b080df13aa360237))
+* **store:** add encryption-at-rest support for namespaces ([0dde046](https://github.com/asaidimu/blobs/commit/0dde04627babad03f8a44f8d8ec88f1bdeed96e5))
+
 ## [1.3.1](https://github.com/asaidimu/blobs/compare/v1.3.0...v1.3.1) (2026-08-07)
 
 
