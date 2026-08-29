@@ -807,6 +807,10 @@ func (m *MemoryBackend) GetMulti(_ context.Context, keys [][]byte) ([][]byte, er
 
 func (m *MemoryBackend) Scan(_ context.Context, prefix []byte, fn func(k, v []byte) error) error {
 	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return &errors.ClosedError{}
+	}
 	var keys []string
 	for k := range m.data {
 		if bytes.HasPrefix([]byte(k), prefix) {
@@ -858,7 +862,6 @@ func (m *MemoryBackend) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
-	m.data = nil
 	return nil
 }
 
