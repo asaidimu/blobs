@@ -214,24 +214,69 @@ func (idx *Index) DeleteBlob(ctx context.Context, id object.BlobID) error {
 // PurgeDeadBlobs removes every blob manifest whose RefCount has reached
 // zero. Blob records are keyed by content and hold no owned data — chunk
 // records are independent and carry their own refcounts — so removing a
-// dead manifest is always safe and never drops live bytes. Returns the
-// number of manifests removed.
+// dead manifest is always safe and never drops live bytes, PROVIDED the
+// RefCount is still zero at the moment of deletion. Returns the number
+// of manifests removed.
+//
+// The scan below only takes a snapshot of each blob's RefCount; between
+// that read and the eventual delete, a concurrent Put may dedup against
+// this exact blob's content (a second Put of identical bytes) and bump
+// RefCount back to 1 — reusing the existing manifest rather than writing
+// a new one. Deleting the manifest at that point would orphan the
+// concurrent Put's brand-new ref, which is exactly what produced
+// "get blob manifest: ... not found" errors from Get under concurrent
+// Put/Compact load before this fix. Each candidate is therefore
+// re-checked and deleted atomically, in its own transaction, so the
+// decision can never go stale between check and delete.
 func (idx *Index) PurgeDeadBlobs(ctx context.Context) (int, error) {
-	var removed int
+	var candidates []object.BlobID
 	err := idx.b.Scan(ctx, prefixBlob(), func(k, v []byte) error {
 		var blob object.BlobEntry
 		if err := unmarshal(v, &blob); err != nil {
 			return err
 		}
 		if blob.RefCount == 0 {
-			if err := idx.b.Delete(ctx, k); err != nil {
-				return err
-			}
-			removed++
+			candidates = append(candidates, blob.BlobID)
 		}
 		return nil
 	})
-	return removed, err
+	if err != nil {
+		return 0, err
+	}
+
+	var removed int
+	for _, id := range candidates {
+		key := keyBlob(id)
+		var didRemove bool
+		err := idx.b.Tx(ctx, func(tx Tx) error {
+			raw, err := tx.Get(key)
+			if err != nil {
+				if IsNotFound(err) {
+					return nil // already gone (another purge got it first)
+				}
+				return err
+			}
+			var blob object.BlobEntry
+			if err := unmarshal(raw, &blob); err != nil {
+				return err
+			}
+			if blob.RefCount > 0 {
+				return nil // resurrected by a concurrent Put — leave it alone
+			}
+			if err := tx.Delete(key); err != nil {
+				return err
+			}
+			didRemove = true
+			return nil
+		})
+		if err != nil {
+			return removed, err
+		}
+		if didRemove {
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // ── Chunks ────────────────────────────────────────────────────────────────────
@@ -305,6 +350,91 @@ func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object
 
 func (idx *Index) DeleteChunk(ctx context.Context, id object.ChunkID) error {
 	return idx.b.Delete(ctx, keyChunk(id))
+}
+
+// ReapPhysicalPageIfDead atomically decides whether a specific scanned
+// physical page — identified by its ChunkID *and* its exact SegmentID +
+// PageOffset — is safe to mark deleted, and removes the chunk's index
+// record if this page turns out to be both the current canonical
+// location and confirmed dead.
+//
+// This exists to close a TOCTOU race in compaction, in a form stronger
+// than checking RefCount by ChunkID alone. compactPhase1 gathers dead
+// physical pages by scanning: for a single ChunkID it can legitimately
+// collect *several* physical pages from entirely different, sequential
+// lifecycle generations — a chunk can be created, referenced, deleted,
+// and recreated at a brand-new physical location multiple times while
+// one Compact() call's scan is still in progress, since content-addressed
+// IDs are deterministic and a fast delete/re-Put loop reuses the same
+// hash every time. A verdict keyed only by ChunkID ("is this content
+// dead *right now*?") is not enough: checking RefCount once and applying
+// that single verdict to every physical page sharing that ChunkID
+// conflates independent generations. A page from an *earlier* generation
+// that's genuinely gone is safe to reap unconditionally. A page from a
+// *later* generation — created by a Put that ran after the RefCount
+// check, reusing the same content hash — is NOT safe to reap just
+// because some earlier check on the same ChunkID happened to see
+// RefCount 0, because that check never saw this generation's write at
+// all. Comparing SegmentID/PageOffset against the record's CURRENT
+// location, atomically with the liveness check, tells them apart: a
+// mismatch means this page belongs to a superseded generation (reap
+// unconditionally), a match means this page is the live record's own
+// storage (reap only if RefCount is actually 0 right now).
+//
+// Returns (safeToReap, recordDeleted, error). safeToReap tells the caller
+// whether it's safe to mark exactly this physical page deleted.
+// recordDeleted additionally reports whether this call also deleted the
+// chunk's index record (true only when this page was the current
+// canonical location and RefCount was confirmed zero) — callers that
+// track a "dead chunk records" count use this instead of safeToReap so
+// stale phantom pages (reaped but never owning the index record) aren't
+// double-counted against it.
+func (idx *Index) ReapPhysicalPageIfDead(ctx context.Context, id object.ChunkID, segID object.SegmentID, pageOffset int64) (safeToReap bool, recordDeleted bool, err error) {
+	err = idx.b.Tx(ctx, func(tx Tx) error {
+		raw, err := tx.Get(keyChunk(id))
+		if err != nil {
+			if IsNotFound(err) {
+				// No record at all for this ChunkID right now. Whatever
+				// this physical page once was, nothing currently
+				// references it — safe regardless of generation.
+				safeToReap = true
+				return nil
+			}
+			return err
+		}
+		var chunk object.ChunkEntry
+		if err := unmarshal(raw, &chunk); err != nil {
+			return err
+		}
+		if chunk.SegmentID != segID || chunk.PageOffset != pageOffset {
+			// The current record points somewhere else entirely — this
+			// scanned page is a stale, superseded generation's storage
+			// (or a write-time phantom duplicate). It is not, and can
+			// never again become, anyone's canonical copy, regardless of
+			// the current record's RefCount. Reap it, but do NOT touch
+			// the index record: it belongs to a different, possibly live,
+			// generation.
+			safeToReap = true
+			return nil
+		}
+		// This page IS the record's current canonical location. Only
+		// safe to reap — and only safe to delete the record — if
+		// RefCount is genuinely zero right now.
+		if chunk.RefCount > 0 {
+			safeToReap = false
+			return nil
+		}
+		if err := tx.Delete(keyChunk(id)); err != nil {
+			return err
+		}
+		safeToReap = true
+		recordDeleted = true
+		return nil
+	})
+	if err != nil {
+		return false, false, err
+	}
+	return safeToReap, recordDeleted, nil
 }
 
 // ── Segments ──────────────────────────────────────────────────────────────────
@@ -515,6 +645,22 @@ func (idx *Index) CommitPut(
 		//    location would make reads fail, so an existing record owned by
 		//    another namespace is treated as absent — we register our own
 		//    copy instead (the pre-dedup behavior).
+		//
+		//    A dedup-hit can land on a chunk record that is *currently
+		//    dead* (RefCount == 0, but not yet reaped by Compact — dying
+		//    only drops the RefCount, it doesn't delete the record or
+		//    touch the physical page). Reviving it this way keeps the
+		//    SAME physical location for potentially many further
+		//    die/revive cycles, with no new page ever written for it —
+		//    each such cycle would otherwise count its own +1 against
+		//    DeadBytes/DeadChunks that no future Compact call could ever
+		//    match to an actual reap, since there is only ever the one
+		//    physical page to reclaim. Reviving a dead record must cancel
+		//    the earlier increment its death produced, symmetric with how
+		//    dying produces one: only a page that is *still* logically
+		//    dead at the moment Compact examines it should count toward
+		//    the persistent dead-byte backlog.
+		var revivedBytes, revivedChunks int64
 		var newPhysicalBytes int64
 		for _, chunk := range chunks {
 			existingRaw, err := tx.Get(keyChunk(chunk.ChunkID))
@@ -524,6 +670,10 @@ func (idx *Index) CommitPut(
 					return err
 				}
 				if existing.NamespaceID == ref.NamespaceID {
+					if existing.RefCount == 0 {
+						revivedBytes += existing.Length
+						revivedChunks++
+					}
 					existing.RefCount++
 					v, err := marshal(existing)
 					if err != nil {
@@ -567,8 +717,8 @@ func (idx *Index) CommitPut(
 			stats.ChunkCount += int64(len(chunks)) - oldChunkCount
 		}
 		stats.BytesPhysical += newPhysicalBytes
-		stats.DeadBytes += deadBytes
-		stats.DeadChunks += deadChunks
+		stats.DeadBytes += deadBytes - revivedBytes
+		stats.DeadChunks += deadChunks - revivedChunks
 		return putStatsTx(tx, stats)
 	})
 	if err != nil {

@@ -1224,18 +1224,21 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	defer h.store.endNSOp(h.nsID)
 
 	var (
-		deadChunks   []object.ChunkEntry // physical pages to mark deleted
-		deadChunkIDs []object.ChunkID    // index records with RefCount == 0 to remove
-		bytesFreed   int64
-		chunksFreed  int64
+		deadChunks  []object.ChunkEntry // physical pages to re-verify and, if still dead, reap
+		bytesFreed  int64
+		chunksFreed int64
 	)
 
 	// indexCache avoids re-fetching the same chunk record from the index
 	// once per physical page: ScanSegments visits every page of a chunk,
 	// and a chunk shared across blobs is hit many times. A nil cached
-	// entry marks a ChunkID already confirmed absent.
+	// entry marks a ChunkID already confirmed absent. This cache only
+	// filters which pages get queued into deadChunks for later
+	// individual re-verification below — it is never the basis for an
+	// actual mutation, so its staleness (a chunk's RefCount changing
+	// after it's cached) can at worst mean a page is skipped this pass
+	// and picked up by the next Compact call, never a wrong reap.
 	indexCache := make(map[object.ChunkID]*object.ChunkEntry)
-	deadIDSeen := make(map[object.ChunkID]struct{})
 
 	lookupChunk := func(id object.ChunkID) *object.ChunkEntry {
 		if c, ok := indexCache[id]; ok {
@@ -1266,28 +1269,53 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		deadChunks = append(deadChunks, entry)
 		bytesFreed += entry.Length
 		chunksFreed++
-		if _, ok := deadIDSeen[entry.ChunkID]; !ok {
-			deadIDSeen[entry.ChunkID] = struct{}{}
-			deadChunkIDs = append(deadChunkIDs, entry.ChunkID)
-		}
 		return nil
 	}); err != nil {
 		return CompactResult{}, fmt.Errorf("store: compact scan: %w", err)
 	}
 
-	// Mark deleted in the volume.
+	// Re-confirm and mark deleted each dead-looking physical page, one at
+	// a time, each behind its own atomic check-and-maybe-delete. The scan
+	// above only takes a snapshot of each page's ChunkID's RefCount; by
+	// the time we get here, that content hash's lifecycle may have moved
+	// on entirely — a fast delete/re-Put loop can create and destroy
+	// several independent "generations" of the same content hash while
+	// one scan is still in progress. A verdict must never be shared
+	// across physical pages just because they carry the same ChunkID:
+	// ReapPhysicalPageIfDead re-checks each page individually against the
+	// index's *current* record, comparing both RefCount and location, so
+	// a page from a stale generation is reaped unconditionally while a
+	// page that's still the record's own canonical storage is only
+	// reaped (and its record only deleted) if RefCount is genuinely zero
+	// right now. chunksFreed/bytesFreed are corrected below to only count
+	// pages actually reaped, not ones a race saved. Because the write path
+	// guarantees at most one live physical page per index-record
+	// "generation" (a dedup-hit's freshly-written duplicate page is reaped
+	// immediately, before ever reaching this scan), every page reaped here
+	// corresponds to exactly one earlier "generation died" event that
+	// already incremented stats.DeadBytes/DeadChunks (in CommitDelete or
+	// CommitPut's overwrite path) — regardless of whether the index record
+	// itself was deleted just now or was already removed earlier (by a
+	// previous Compact call, or by an earlier entry in this same loop for
+	// a different, now-superseded physical copy of the same ChunkID).
+	// chunksFreed/bytesFreed are therefore the correct totals to reconcile
+	// those stats below, not just the subset where this call happened to
+	// also delete the record.
 	for _, chunk := range deadChunks {
+		if ctx.Err() != nil {
+			return CompactResult{}, ctx.Err()
+		}
+		safeToReap, _, err := h.store.idx.ReapPhysicalPageIfDead(ctx, chunk.ChunkID, chunk.SegmentID, chunk.PageOffset)
+		if err != nil {
+			return CompactResult{}, fmt.Errorf("store: confirm dead chunk: %w", err)
+		}
+		if !safeToReap {
+			bytesFreed -= chunk.Length
+			chunksFreed--
+			continue
+		}
 		if err := eng.MarkDeleted(chunk); err != nil {
 			return CompactResult{}, fmt.Errorf("store: mark deleted: %w", err)
-		}
-	}
-
-	// Remove index records for chunks whose RefCount reached zero. Phantom
-	// duplicate pages (dead but sharing a live chunk's content hash) leave
-	// the index record alone — it belongs to the live canonical copy.
-	for _, cid := range deadChunkIDs {
-		if err := h.store.idx.DeleteChunk(ctx, cid); err != nil {
-			return CompactResult{}, fmt.Errorf("store: delete chunk record: %w", err)
 		}
 	}
 
@@ -1299,17 +1327,26 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		return CompactResult{}, fmt.Errorf("store: purge dead blobs: %w", err)
 	}
 
-	// Decrement the namespace stats so they reflect the reaped chunks and
-	// purged blobs. Without this the stats retain stale DeadBytes /
-	// DeadChunks / BlobCount counts long after the physical space has been
-	// reclaimed.
+	// Decrement the namespace stats so they reflect the reaped chunks.
+	// Without this the stats retain stale DeadBytes/DeadChunks counts long
+	// after the physical space has been reclaimed.
+	//
+	// BlobCount is deliberately NOT touched here. It counts live refs
+	// (keys), and is decremented exactly once, in CommitDelete, at the
+	// moment a ref is removed — before the blob it pointed at necessarily
+	// has RefCount 0 (another ref may still exist) or is purged (that
+	// happens later, here, once RefCount does reach 0). Decrementing
+	// BlobCount again for every manifest PurgeDeadBlobs removes would
+	// double-count the same ref removal: once when the ref actually
+	// disappeared, and again whenever its now-orphaned manifest is later
+	// swept up by compaction — silently driving BlobCount negative under
+	// any sustained delete/compact workload.
 	stats, err := h.store.idx.GetStats(ctx, h.nsID)
 	if err != nil {
 		return CompactResult{}, fmt.Errorf("store: compact: get stats: %w", err)
 	}
 	stats.DeadBytes -= bytesFreed
-	stats.DeadChunks -= int64(len(deadChunkIDs))
-	stats.BlobCount -= int64(blobsRemoved)
+	stats.DeadChunks -= chunksFreed
 	if err := h.store.idx.PutStats(ctx, *stats); err != nil {
 		return CompactResult{}, fmt.Errorf("store: compact: put stats: %w", err)
 	}
