@@ -1,3 +1,11 @@
+## [1.3.3](https://github.com/asaidimu/blobs/compare/v1.3.2...v1.3.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* **index:** resolve race condition in namespace stats reconciliation ([d878e9b](https://github.com/asaidimu/blobs/commit/d878e9b72bf947a859f7a8a3004f518160be9612))
+* **store,index:** close TOCTOU races in compaction that corrupt live data; reconcile stats ([519e99a](https://github.com/asaidimu/blobs/commit/519e99a4bae79ff4fa477d9da2ff66fb20e720d8))
+
 ## [1.3.2](https://github.com/asaidimu/blobs/compare/v1.3.1...v1.3.2) (2026-08-29)
 
 
