@@ -512,6 +512,33 @@ func (idx *Index) PutStats(ctx context.Context, stats object.NamespaceStats) err
 	return idx.b.Put(ctx, keyStats(stats.NamespaceID), v)
 }
 
+// ReconcileDeadStats atomically subtracts deadBytes and deadChunks from the
+// namespace's stats, clamping to zero. This closes a lost-update race in
+// compactPhase1: a non-atomic GetStats/Subtract/PutStats can overwrite
+// concurrent CommitPut/CommitDelete changes to other stats fields (BlobCount,
+// BytesStored, etc.) or double-subtract DeadBytes/DeadChunks when concurrent
+// Compact calls overlap. Running the read-modify-write inside a transaction
+// serialises it against CommitPut/CommitDelete's own transactions, and
+// clamping prevents negative residuals from a concurrent reap that already
+// handled the same generation.
+func (idx *Index) ReconcileDeadStats(ctx context.Context, nsID string, deadBytes, deadChunks int64) error {
+	return idx.b.Tx(ctx, func(tx Tx) error {
+		stats, err := getStatsTx(tx, nsID)
+		if err != nil {
+			return err
+		}
+		stats.DeadBytes -= deadBytes
+		if stats.DeadBytes < 0 {
+			stats.DeadBytes = 0
+		}
+		stats.DeadChunks -= deadChunks
+		if stats.DeadChunks < 0 {
+			stats.DeadChunks = 0
+		}
+		return putStatsTx(tx, stats)
+	})
+}
+
 // ── Atomic write paths ────────────────────────────────────────────────────────
 
 // CommitPut atomically writes a new blob to the index and updates stats.

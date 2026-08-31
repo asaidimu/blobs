@@ -1341,14 +1341,16 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	// disappeared, and again whenever its now-orphaned manifest is later
 	// swept up by compaction — silently driving BlobCount negative under
 	// any sustained delete/compact workload.
-	stats, err := h.store.idx.GetStats(ctx, h.nsID)
-	if err != nil {
-		return CompactResult{}, fmt.Errorf("store: compact: get stats: %w", err)
-	}
-	stats.DeadBytes -= bytesFreed
-	stats.DeadChunks -= chunksFreed
-	if err := h.store.idx.PutStats(ctx, *stats); err != nil {
-		return CompactResult{}, fmt.Errorf("store: compact: put stats: %w", err)
+	//
+	// ReconcileDeadStats performs the read-modify-write atomically inside
+	// a transaction, closing a lost-update race where a concurrent
+	// CommitPut/CommitDelete could update stats between our Get and Put,
+	// and our Put would overwrite those changes (losing BlobCount,
+	// BytesStored, etc. decrements). It also clamps to zero so a
+	// concurrent reap that already handled the same generation cannot
+	// drive DeadBytes/DeadChunks negative.
+	if err := h.store.idx.ReconcileDeadStats(ctx, h.nsID, bytesFreed, chunksFreed); err != nil {
+		return CompactResult{}, fmt.Errorf("store: compact: reconcile stats: %w", err)
 	}
 
 	return CompactResult{
