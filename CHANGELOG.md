@@ -1,3 +1,10 @@
+## [1.3.4](https://github.com/asaidimu/blobs/compare/v1.3.3...v1.3.4) (2026-09-10)
+
+
+### Bug Fixes
+
+* **object:** allow underscores in namespace IDs ([b364d91](https://github.com/asaidimu/blobs/commit/b364d91f07e8282d586c9dd28938e6a6c8d1fd5a))
+
 ## [1.3.3](https://github.com/asaidimu/blobs/compare/v1.3.2...v1.3.3) (2026-08-31)
 
 
