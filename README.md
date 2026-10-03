@@ -12,8 +12,8 @@ for crash recovery.
 
 ## Features
 
-- **Content addressing** — blobs keyed by `sha256:<hex>`; deduplication is automatic.
-- **Namespace isolation** — logical partitions with optional per-namespace quotas.
+- **Content addressing** — blobs keyed by `sha256:<hex>`; deduplication is automatic and happens *within* a namespace.
+- **Namespace isolation** — logical partitions with optional per-namespace quotas. Each namespace owns its index records and its directory outright (keyed by an opaque UID, not its name), so tenants share no state and a re-created name shares nothing with its predecessor.
 - **Pluggable index** — `MemoryBackend` for tests, `BboltBackend` for production (ACID, single-file, crash-safe).
 - **Segment-based storage** — fixed-size pages (default 16 KB), cache-aligned headers, zero-allocation read path.
 - **Write-Ahead Log (WAL)** — fsync'd before return; survive process crash after `Put` succeeds.
@@ -67,7 +67,7 @@ indefinitely.
 
 | Field | Default | Description |
 |---|---|---|---|
-| `DataDir` | required | Root for segment/WAL files. One subdirectory per namespace. |
+| `DataDir` | required | Root for segment/WAL files. One subdirectory per namespace, named after its opaque `UID` (see `object.Namespace.UID`), not its name. |
 | `Index` | required | Pluggable `Backend` — see table above. |
 | `PageSize` | 16384 | Size of each page in segment files. Must be > 88 (header size) and ≤ uint32 max. |
 | `ChunkSize` | 4 MB | Target chunk size before splitting. Must not exceed `MaxSegmentSize`. |
@@ -93,12 +93,59 @@ nsList, _ := s.ListNamespaces(ctx)
 // Get a scoped handle (cheap — no I/O).
 ns := s.Namespace("my-app")
 
-// Delete a namespace and all its refs.
+// Delete a namespace and erase everything it owns.
 s.DeleteNamespace(ctx, "my-app")
 ```
 
-Namespace IDs must match `^[a-z0-9][a-z0-9\-]{0,61}[a-z0-9]$` (2–63 chars,
-lowercase alphanumeric plus hyphens).
+Namespace IDs must match `^[a-z0-9][a-z0-9\-_]{0,61}[a-z0-9]$` (2–63 chars,
+lowercase alphanumeric plus hyphens and underscores).
+
+### Namespace identity and deletion
+
+A namespace's *name* is only a pointer to its *UID*, a random identifier the
+store assigns at creation (`object.Namespace.UID`; anything you pass in is
+ignored). Index records and the on-disk directory are keyed by UID, never by
+name.
+
+`DeleteNamespace` is two-phase:
+
+1. **Unlink (atomic).** One index transaction releases the name and records a
+   tombstone. From that instant the name can be created again, the old
+   namespace is unreachable, and — for an encrypted namespace — its wrapped key
+   is gone.
+2. **Erase.** Once operations already running on the namespace (including
+   readers from `Get`) finish, its index records, segment files, WAL files and
+   directory are removed. Deleting one namespace never blocks, or is blocked
+   by, another.
+
+If phase 2 cannot finish (backend failure, or your context expired while
+readers drained) `DeleteNamespace` returns `*errors.CleanupPendingError`: the
+namespace *is* deleted, only the erase is outstanding. Call
+`s.CleanupDeletedNamespaces(ctx)` to finish it; `Open` also does so
+automatically.
+
+Erasure removes files; it does not overwrite their blocks. If deleted data must
+be unrecoverable from the device, use an encrypted namespace (`WithEncryption`).
+
+### Upgrading from v1.3.x and earlier
+
+`Open` upgrades an older index in place the first time it sees it; see
+`s.MigrationReport()`. Existing namespaces keep their directories (their UID
+equals their name). The upgrade also repairs chunk records that the old code let
+another namespace overwrite when two namespaces stored identical content.
+
+The index format change is one-way: **back up your index before the first
+`Open` with this version, and do not open an upgraded index with an older
+version.**
+
+### Disaster recovery: reattaching segments to a lost index
+
+If the index is lost but a namespace's directory survives, recreate the
+namespace with `store.WithRecoveredUID("<directory name>")` to adopt that
+directory, then call `RebuildIndex`. This is an operator-only option — never
+expose it to tenants — and it refuses a directory already owned by a live or
+pending-deletion namespace. It cannot recover encrypted namespaces, whose keys
+lived in the lost index.
 
 ---
 
@@ -128,7 +175,9 @@ segment with CRC-32, fsyncs, appends the WAL, then atomically commits ref + blob
 manifest + chunk locations + stats to the index.
 
 If the key already exists, the old ref is replaced and the previous blob becomes
-GC-eligible (ref-counted). Duplicate content is automatically deduplicated.
+GC-eligible (ref-counted). Duplicate content is automatically deduplicated
+within the namespace; identical bytes stored by two namespaces are kept
+separately, which is what keeps tenants isolated.
 
 ### Get — read a blob
 

@@ -72,9 +72,13 @@ func openEncryptedStore(t *testing.T) (*store.Store, string) {
 // segmentBytes concatenates every seg-*.vol file's raw bytes under a
 // namespace's directory, for tests that need to inspect what's actually
 // on disk rather than what the store API returns.
-func segmentBytes(t *testing.T, dataDir, nsID string) []byte {
+func segmentBytes(t *testing.T, s *store.Store, dataDir, name string) []byte {
 	t.Helper()
-	nsDir := filepath.Join(dataDir, nsID)
+	rec, err := s.GetNamespace(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetNamespace(%q): %v", name, err)
+	}
+	nsDir := filepath.Join(dataDir, rec.UID)
 	entries, err := os.ReadDir(nsDir)
 	if err != nil {
 		t.Fatalf("read namespace dir: %v", err)
@@ -160,7 +164,7 @@ func TestEncryptedNamespace_CiphertextOnDisk(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	onDisk := segmentBytes(t, dataDir, "secure")
+	onDisk := segmentBytes(t, s, dataDir, "secure")
 	if bytes.Contains(onDisk, secret) {
 		t.Fatal("plaintext marker found verbatim in encrypted namespace's segment file(s) on disk")
 	}
@@ -194,7 +198,7 @@ func TestUnencryptedNamespace_PlaintextOnDisk(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	onDisk := segmentBytes(t, dir, "plain")
+	onDisk := segmentBytes(t, s, dir, "plain")
 	if !bytes.Contains(onDisk, []byte("THIS IS PLAINTEXT MARKER")) {
 		t.Fatal("expected plaintext marker to appear verbatim in unencrypted namespace's segment file(s)")
 	}

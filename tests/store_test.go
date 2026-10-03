@@ -639,15 +639,20 @@ func TestVerify_Corrupted(t *testing.T) {
 
 	ns := s.Namespace("default")
 	putBytes(t, ns, "victim", randBytes(512))
+	victimRec, err := s.GetNamespace(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	victimUID := victimRec.UID
 
 	// Close cleanly so all data is flushed.
 	s.Close()
 
 	// Corrupt a segment file by flipping bytes in the middle.
-	entries, _ := os.ReadDir(dir + "/" + "default")
+	entries, _ := os.ReadDir(dir + "/" + victimUID)
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".vol") {
-			path := dir + "/" + "default" + "/" + e.Name()
+			path := dir + "/" + victimUID + "/" + e.Name()
 			data, _ := os.ReadFile(path)
 			if len(data) > 200 {
 				data[150] ^= 0xFF

@@ -82,3 +82,26 @@ func (e *InvalidNamespaceIDError) Error() string {
 type ClosedError struct{}
 
 func (e *ClosedError) Error() string { return "store is closed" }
+
+// CleanupPendingError is returned by Store.DeleteNamespace when the namespace
+// was logically deleted — its name is released and it is unreachable — but
+// erasing its data did not complete (a backend failure, or the caller's
+// context expired while in-flight operations drained). The data is not
+// reachable through the store, but it has not been erased from disk yet.
+// Call Store.CleanupDeletedNamespaces to finish the job; Store.Open also does
+// so automatically.
+type CleanupPendingError struct {
+	NamespaceID string
+	UID         string
+	Err         error
+}
+
+func (e *CleanupPendingError) Error() string {
+	return fmt.Sprintf(
+		"namespace %q deleted, but erasing its data (uid %s) is pending: %v",
+		e.NamespaceID, e.UID, e.Err,
+	)
+}
+
+// Unwrap exposes the underlying cause to errors.Is / errors.As.
+func (e *CleanupPendingError) Unwrap() error { return e.Err }

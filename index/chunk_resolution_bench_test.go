@@ -42,7 +42,7 @@ func seedChunks(b *testing.B, idx *index.Index, n int) []object.ChunkID {
 func loopGetChunk(b *testing.B, idx *index.Index, ids []object.ChunkID) {
 	ctx := context.Background()
 	for _, id := range ids {
-		if _, err := idx.GetChunk(ctx, id); err != nil {
+		if _, err := idx.GetChunk(ctx, "bench", id); err != nil {
 			b.Fatalf("GetChunk(%s): %v", id, err)
 		}
 	}
@@ -62,7 +62,7 @@ func benchmarkChunkResolution(b *testing.B, idx *index.Index, chunkCount int) {
 	b.Run("Batched_GetChunks", func(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if _, err := idx.GetChunks(ctx, ids); err != nil {
+			if _, err := idx.GetChunks(ctx, "bench", ids); err != nil {
 				b.Fatalf("GetChunks: %v", err)
 			}
 		}

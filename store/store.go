@@ -101,199 +101,41 @@ type ListOptions struct {
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 // Store is the top-level handle. Safe for concurrent use.
+//
+// Locking model — why one tenant's lifecycle never stalls another's:
+//
+//   - Store.mu guards only the maps and the closed flag, and is held for a
+//     few instructions at a time, never across I/O or while waiting for
+//     another lock.
+//   - Each operation registers on Store.inflight; Close waits on it.
+//   - Each namespace has its own nsState with two locks: life (every
+//     operation holds it shared for its whole duration; the final erase of a
+//     deleted namespace takes it exclusively to drain them) and rw (the
+//     engine guard, exclusive only for Compact phase 2's segment rewrite).
 type Store struct {
+	cfg Config
+	idx *index.Index
+
 	mu      sync.RWMutex
-	cfg     Config
-	idx     *index.Index
-	engines map[string]*volume.Engine // keyed by namespace ID
+	states  map[string]*nsState // live namespaces, by name
+	pending map[string]*nsState // unlinked but not yet erased, by UID
 	closed  bool
 
-	// quotaMu provides per-namespace mutual exclusion for the quota-check +
-	// CommitPut window (VULN 8 fix). Without this, N concurrent Puts in the
-	// same namespace could all read stats=0, all pass the quota check, all
-	// write to disk, then all commit — exceeding the quota by factor N.
-	// sync.Map stores *sync.Mutex keyed by namespace ID.
-	// Using a per-namespace mutex (not the global store mutex) avoids
-	// blocking Puts across different namespaces.
-	quotaMu sync.Map
+	inflight sync.WaitGroup
 
-	// nsRW provides per-namespace read-write mutual exclusion between
-	// ordinary volume-engine operations (Put, Get, Verify, RebuildIndex,
-	// Compact phase 1 — all taken as shared read guards) and Compact
-	// phase 2's segment rewrite (taken as an exclusive write guard) for
-	// that same namespace. sync.Map stores *sync.RWMutex keyed by
-	// namespace ID. This is what lets a segment rewrite on namespace A
-	// block only namespace A's own operations instead of the whole
-	// store — see beginNSOp and beginExclusiveNSOp.
-	nsRW sync.Map
-}
+	// admin serialises namespace creation and the unlink step of deletion,
+	// so a name cannot be created and deleted concurrently.
+	admin sync.Mutex
 
-// Open opens an existing store or creates a new one.
-func Open(cfg Config) (*Store, error) {
-	if cfg.DataDir == "" {
-		return nil, fmt.Errorf("store: Config.DataDir must not be empty")
-	}
-	if cfg.Index == nil {
-		return nil, fmt.Errorf("store: Config.Index must be provided")
-	}
-	volOpts := volume.Options{
-		PageSize:       cfg.PageSize,
-		ChunkSize:      cfg.ChunkSize,
-		MaxSegmentSize: cfg.MaxSegmentSize,
-	}
-	if err := volOpts.Validate(); err != nil {
-		return nil, fmt.Errorf("store: %w", err)
-	}
+	// purging holds one *sync.Mutex per UID so two erases of the same
+	// namespace (an explicit DeleteNamespace and a CleanupDeletedNamespaces)
+	// never run at once.
+	purging sync.Map
 
-	s := &Store{
-		cfg:     cfg,
-		idx:     index.New(cfg.Index),
-		engines: make(map[string]*volume.Engine),
-	}
-
-	ctx := context.Background()
-
-	// Open volume engines for all known namespaces.
-	namespaces, err := s.idx.ListNamespaces(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("store: list namespaces on open: %w", err)
-	}
-	for _, ns := range namespaces {
-		if err := s.openEngine(ctx, ns.ID); err != nil {
-			return nil, fmt.Errorf("store: open engine for %q: %w", ns.ID, err)
-		}
-	}
-
-	return s, nil
-}
-
-// Close flushes and closes all engines and the index backend.
-//
-// Close waits for every in-flight operation to finish before tearing
-// anything down: it does this by taking Store's write lock, and every
-// operation that touches the index or a volume engine holds the
-// corresponding read lock for its own full duration (see beginOp /
-// beginNSOp), not just for the moment it looks up an engine pointer. Since
-// a pending Lock() call blocks new RLock() callers and waits for existing
-// ones to release, this makes Close a true drain point: no operation that
-// was already running when Close was called can still be touching an
-// engine or the index by the time Close proceeds to shut them down, and no
-// new operation can start once Close has begun.
-//
-// One case Close cannot protect against: NamespaceHandle.Get returns an
-// io.ReadCloser whose actual disk reads happen after Get itself has
-// returned, so the read guard it acquired is held until the caller closes
-// that reader — not until Get returns. A caller that obtains a reader and
-// never closes it will cause Close to block indefinitely, exactly as
-// leaking any other closable handle (an unclosed *os.File, an unclosed
-// http.Response.Body) would jam an equivalent drain/shutdown sequence
-// elsewhere. Always close readers returned by Get.
-func (s *Store) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return &bserrors.ClosedError{}
-	}
-	s.closed = true
-
-	var errs []error
-	for id, eng := range s.engines {
-		if err := eng.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("engine %q: %w", id, err))
-		}
-	}
-	if err := s.idx.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("index: %w", err))
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("store: close errors: %v", errs)
-	}
-	return nil
+	migration MigrationReport
 }
 
 // ── Namespace management ──────────────────────────────────────────────────────
-
-// CreateNamespaceOption configures optional behavior for CreateNamespace.
-type CreateNamespaceOption func(*createNamespaceConfig)
-
-type createNamespaceConfig struct {
-	encrypt bool
-}
-
-// WithEncryption enables encryption-at-rest for the namespace being
-// created. A random 256-bit data-encryption key (DEK) is generated for
-// this namespace and wrapped under the current master key from
-// Config.KeyProvider (which must therefore be non-nil), before being
-// persisted — the DEK itself is never stored in the clear.
-//
-// This is a one-time, per-namespace decision made here, at creation:
-// every chunk this namespace ever writes from this point on is
-// encrypted, and there is no supported way to flip it on for an
-// already-populated namespace after the fact (see package encryption's
-// doc comment).
-func WithEncryption() CreateNamespaceOption {
-	return func(c *createNamespaceConfig) { c.encrypt = true }
-}
-
-// CreateNamespace creates a new isolated partition within the store.
-// Returns *errors.AlreadyExistsError if nsID is already in use.
-func (s *Store) CreateNamespace(ctx context.Context, ns object.Namespace, opts ...CreateNamespaceOption) error {
-	if err := object.ValidateNamespaceID(ns.ID); err != nil {
-		return err
-	}
-
-	var cfg createNamespaceConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, err := s.idx.GetNamespace(ctx, ns.ID); err == nil {
-		return &bserrors.AlreadyExistsError{NamespaceID: ns.ID}
-	} else if !index.IsNotFound(err) {
-		return fmt.Errorf("store: check namespace: %w", err)
-	}
-
-	if cfg.encrypt {
-		if s.cfg.KeyProvider == nil {
-			return fmt.Errorf("store: WithEncryption requires Config.KeyProvider to be set")
-		}
-		dek, err := encryption.GenerateKey()
-		if err != nil {
-			return fmt.Errorf("store: generate namespace key: %w", err)
-		}
-		masterKey, version, err := s.cfg.KeyProvider.CurrentKey()
-		if err != nil {
-			return fmt.Errorf("store: get current master key: %w", err)
-		}
-		wrapped, err := encryption.WrapKey(masterKey, dek)
-		if err != nil {
-			return fmt.Errorf("store: wrap namespace key: %w", err)
-		}
-		ns.Encryption = &object.EncryptionInfo{
-			Enabled:    true,
-			WrappedDEK: wrapped,
-			KeyVersion: version,
-		}
-	}
-
-	ns.CreatedAt = time.Now().UTC()
-	if err := s.idx.PutNamespace(ctx, ns); err != nil {
-		return fmt.Errorf("store: persist namespace: %w", err)
-	}
-	return s.openEngine(ctx, ns.ID)
-}
-
-// GetNamespace returns the metadata for a namespace.
-func (s *Store) GetNamespace(ctx context.Context, nsID string) (*object.Namespace, error) {
-	if err := s.beginOp(); err != nil {
-		return nil, err
-	}
-	defer s.endOp()
-	return s.idx.GetNamespace(ctx, nsID)
-}
 
 // ListNamespaces returns all namespaces in the store.
 func (s *Store) ListNamespaces(ctx context.Context) ([]object.Namespace, error) {
@@ -304,345 +146,7 @@ func (s *Store) ListNamespaces(ctx context.Context) ([]object.Namespace, error) 
 	return s.idx.ListNamespaces(ctx)
 }
 
-// DeleteNamespace removes a namespace and all its refs.
-// Physical bytes are not reclaimed until GC/compaction runs on the engine.
-func (s *Store) DeleteNamespace(ctx context.Context, nsID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	eng, ok := s.engines[nsID]
-	if !ok {
-		return &bserrors.NotFoundError{NamespaceID: nsID}
-	}
-
-	// Close and discard the engine.
-	if err := eng.Close(); err != nil {
-		return fmt.Errorf("store: close engine for %q: %w", nsID, err)
-	}
-	delete(s.engines, nsID)
-
-	// Remove all refs from the index.
-	refs, err := s.idx.ListRefs(ctx, nsID, "")
-	if err != nil {
-		return fmt.Errorf("store: list refs for deletion: %w", err)
-	}
-	for _, ref := range refs {
-		if err := s.idx.CommitDelete(ctx, nsID, ref.Key); err != nil && !index.IsNotFound(err) {
-			return fmt.Errorf("store: delete ref %q: %w", ref.Key, err)
-		}
-	}
-
-	return s.idx.DeleteNamespace(ctx, nsID)
-}
-
-// Namespace returns a scoped handle for operations within nsID.
-// This is a cheap call — it performs no I/O.
-func (s *Store) Namespace(nsID string) *NamespaceHandle {
-	return &NamespaceHandle{store: s, nsID: nsID}
-}
-
-// Stats returns aggregate metrics across all namespaces.
-func (s *Store) Stats(ctx context.Context) (*object.StoreStats, error) {
-	if err := s.beginOp(); err != nil {
-		return nil, err
-	}
-	defer s.endOp()
-
-	namespaces, err := s.idx.ListNamespaces(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	out := &object.StoreStats{
-		NamespaceCount: int64(len(namespaces)),
-		ComputedAt:     time.Now().UTC(),
-	}
-	for _, ns := range namespaces {
-		nsStats, err := s.idx.GetStats(ctx, ns.ID)
-		if err != nil {
-			return nil, err
-		}
-		out.PerNamespace = append(out.PerNamespace, *nsStats)
-		out.TotalBlobCount += nsStats.BlobCount
-		out.TotalBytesStored += nsStats.BytesStored
-		out.TotalBytesPhysical += nsStats.BytesPhysical
-		out.TotalDeadBytes += nsStats.DeadBytes
-		out.SegmentCount += nsStats.SegmentCount
-	}
-	if out.TotalBytesPhysical > 0 {
-		out.DeduplicationRatio = float64(out.TotalBytesStored) / float64(out.TotalBytesPhysical)
-	}
-	return out, nil
-}
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
-
-// openEngine opens nsID's volume engine and, before making it available to
-// any caller, replays its WAL: for every durably-committed WriteBlob group
-// found in a WAL file whose blob has no BlobEntry yet in the index — i.e.
-// WriteBlob completed and fsynced, but the process crashed before
-// CommitPut (ref + blob manifest) finished — its BlobEntry and
-// ChunkEntry records are written now.
-//
-// This mirrors RebuildIndex's approach and inherits the same reasoning
-// for RefCount: 1 rather than 0 (see RebuildIndex's doc comment) — a
-// replayed blob has no way to carry forward its real reference count
-// (that mapping lives only in RefEntry, which nothing durable recorded
-// for an interrupted Put), so it is registered as presumed-referenced
-// rather than immediately reapable. An operator (or the original,
-// presumably-retried caller) re-establishes real refs by Put-ing the
-// same content again — safe and idempotent thanks to content addressing.
-//
-// This runs on every openEngine call, not just after a real crash: for a
-// namespace with no unreplayed WAL entries (the overwhelmingly common
-// case — a clean prior shutdown, or a brand new namespace with no
-// segments at all), it costs one cheap directory listing
-// (ListSegmentIDs) and reads each segment's small WAL file, not a full
-// segment scan.
-func (s *Store) openEngine(ctx context.Context, nsID string) error {
-	cipher, err := s.resolveCipher(ctx, nsID)
-	if err != nil {
-		return err
-	}
-
-	eng, err := volume.Open(s.cfg.DataDir, nsID, volume.Options{
-		PageSize:       s.cfg.PageSize,
-		ChunkSize:      s.cfg.ChunkSize,
-		MaxSegmentSize: s.cfg.MaxSegmentSize,
-		Cipher:         cipher,
-	})
-	if err != nil {
-		return err
-	}
-	if err := s.replayWAL(ctx, nsID, eng); err != nil {
-		_ = eng.Close()
-		return fmt.Errorf("replay WAL: %w", err)
-	}
-	s.engines[nsID] = eng
-	return nil
-}
-
-// resolveCipher returns the *encryption.Cipher for nsID's volume Engine,
-// or nil if nsID is unencrypted. For an encrypted namespace, it fetches
-// the namespace's persisted EncryptionInfo, asks Config.KeyProvider for
-// the master key that WrappedDEK was wrapped under (by KeyVersion), and
-// unwraps the DEK — the store never persists a DEK in the clear, so this
-// unwrap happens fresh every time the engine is opened (store startup or
-// namespace creation), not once and cached to disk.
-func (s *Store) resolveCipher(ctx context.Context, nsID string) (*encryption.Cipher, error) {
-	ns, err := s.idx.GetNamespace(ctx, nsID)
-	if err != nil {
-		return nil, fmt.Errorf("store: get namespace %q for engine open: %w", nsID, err)
-	}
-	if ns.Encryption == nil || !ns.Encryption.Enabled {
-		return nil, nil
-	}
-	if s.cfg.KeyProvider == nil {
-		return nil, fmt.Errorf("store: namespace %q is encrypted but Config.KeyProvider is not set", nsID)
-	}
-	masterKey, err := s.cfg.KeyProvider.Key(ns.Encryption.KeyVersion)
-	if err != nil {
-		return nil, fmt.Errorf("store: resolve master key (version %q) for namespace %q: %w", ns.Encryption.KeyVersion, nsID, err)
-	}
-	dek, err := encryption.UnwrapKey(masterKey, ns.Encryption.WrappedDEK)
-	if err != nil {
-		return nil, fmt.Errorf("store: unwrap DEK for namespace %q: %w", nsID, err)
-	}
-	cipher, err := encryption.New(dek)
-	if err != nil {
-		return nil, fmt.Errorf("store: init cipher for namespace %q: %w", nsID, err)
-	}
-	return cipher, nil
-}
-
-// replayWAL parses every segment's WAL file for eng and registers any
-// not-yet-committed blob it finds. See openEngine's doc comment for the
-// full rationale.
-//
-// KNOWN LIMITATION for encrypted namespaces: the WAL's on-disk binary
-// format (see volume.appendWAL) predates this package's encryption
-// support and does not carry a chunk's Nonce/Tag — only ChunkID,
-// location, and length. A chunk replayed from the WAL here therefore
-// gets PutChunk'd with no Nonce/Tag, exactly like a chunk touched by
-// RebuildIndex — but unlike RebuildIndex, this path cannot simply
-// refuse, because it runs unconditionally on every Store.Open. In
-// practice this only matters for the narrow crash window WAL replay
-// exists to cover at all: a segment fsync and its WAL entry both
-// succeeded, but the process died before CommitPut ran. For an
-// encrypted namespace, a crash landing in exactly that window leaves
-// that blob's chunks durably on disk as ciphertext with no recoverable
-// key material — ReadChunk will fail them with the "no nonce/tag"
-// error at volume.Engine.ReadChunk, loudly rather than silently, but
-// they are not recoverable. Extending the WAL format to also carry
-// Nonce/Tag (versioned via segFileHeader.Version, to stay compatible
-// with WAL files written before this field existed) would close this
-// gap; it is intentionally left as a follow-up rather than done here
-// without a way to verify the on-disk format change end-to-end.
-func (s *Store) replayWAL(ctx context.Context, nsID string, eng *volume.Engine) error {
-	segIDs, err := eng.ListSegmentIDs()
-	if err != nil {
-		return fmt.Errorf("list segments for %q: %w", nsID, err)
-	}
-
-	for _, segID := range segIDs {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		entries, err := eng.ParseWAL(segID)
-		if err != nil {
-			return fmt.Errorf("parse WAL for segment %s: %w", segID, err)
-		}
-
-		for _, entry := range entries {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			if _, err := s.idx.GetBlob(ctx, entry.BlobID); err == nil {
-				continue // already committed via CommitPut — nothing to replay
-			} else if !index.IsNotFound(err) {
-				return fmt.Errorf("check blob %s: %w", entry.BlobID, err)
-			}
-
-			var totalSize int64
-			chunkIDs := make([]object.ChunkID, len(entry.Chunks))
-			for _, c := range entry.Chunks {
-				// Presumed referenced, mirroring the blob's RefCount: 1 —
-				// see openEngine's doc comment. A chunk whose WAL entry
-				// survived a crash is referenced by the blob that wrote it.
-				c.RefCount = 1
-				if err := s.idx.PutChunk(ctx, c); err != nil {
-					return fmt.Errorf("replay chunk %s: %w", c.ChunkID, err)
-				}
-				totalSize += c.Length
-				chunkIDs[c.Seq] = c.ChunkID
-			}
-
-			if err := s.idx.PutBlob(ctx, object.BlobEntry{
-				BlobID:    entry.BlobID,
-				ChunkIDs:  chunkIDs,
-				TotalSize: totalSize,
-				RefCount:  1, // presumed referenced — see openEngine's doc comment
-			}); err != nil {
-				return fmt.Errorf("replay blob %s: %w", entry.BlobID, err)
-			}
-		}
-	}
-	return nil
-}
-
-// nsMutex returns the per-namespace mutex used to serialise quota checks.
-// Creates one on first use. The mutex is never deleted — namespace deletion
-// is rare and a leaked empty mutex costs 8 bytes.
-func (s *Store) nsMutex(nsID string) *sync.Mutex {
-	v, _ := s.quotaMu.LoadOrStore(nsID, &sync.Mutex{})
-	return v.(*sync.Mutex)
-}
-
-// nsRWMutex returns the per-namespace read-write mutex used to scope
-// Compact phase 2's exclusivity to a single namespace. Creates one on
-// first use. Never deleted, for the same reason nsMutex isn't.
-func (s *Store) nsRWMutex(nsID string) *sync.RWMutex {
-	v, _ := s.nsRW.LoadOrStore(nsID, &sync.RWMutex{})
-	return v.(*sync.RWMutex)
-}
-
-// beginOp acquires a read guard on the store for an operation that
-// touches the index but not a specific volume engine. It returns
-// *errors.ClosedError if the store is already closed. On success, the
-// caller MUST call endOp exactly once when the operation is entirely
-// done — for an operation that hands back a long-lived handle (only
-// NamespaceHandle.Get does today), that means when the handle itself is
-// closed, not when the method that created it returns. See Close's doc
-// comment for why this is the store's drain mechanism.
-func (s *Store) beginOp() error {
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return &bserrors.ClosedError{}
-	}
-	return nil
-}
-
-// endOp releases the guard acquired by beginOp or beginNSOp.
-func (s *Store) endOp() {
-	s.mu.RUnlock()
-}
-
-// beginNSOp is beginOp plus a namespace engine lookup, for operations that
-// touch a volume engine directly (Put, Get, Verify, RebuildIndex, and
-// Compact's phase 1). On success it holds TWO guards: the store's shared
-// read guard (from beginOp) and this namespace's shared read guard. The
-// second is what scopes Compact phase 2's exclusivity (see
-// beginExclusiveNSOp) to a single namespace: a rewrite running for
-// namespace A takes namespace A's write guard, which blocks new
-// beginNSOp calls for namespace A, but has no effect whatsoever on
-// namespace B's RWMutex — so namespace B's Puts, Gets, and everything
-// else proceed exactly as if nothing were happening.
-//
-// On success the caller MUST call endNSOp(nsID) exactly once when the
-// operation is entirely done — for Get, which hands back a long-lived
-// reader, that means when the reader itself is Closed, not when Get
-// returns (same rule beginOp/endOp already follow; see Close's doc
-// comment). On error, no guard is held and endNSOp must not be called.
-func (s *Store) beginNSOp(nsID string) (*volume.Engine, error) {
-	if err := s.beginOp(); err != nil {
-		return nil, err
-	}
-	eng, ok := s.engines[nsID]
-	if !ok {
-		s.endOp()
-		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
-	}
-	s.nsRWMutex(nsID).RLock()
-	return eng, nil
-}
-
-// endNSOp releases both guards a successful beginNSOp call for nsID
-// acquired.
-func (s *Store) endNSOp(nsID string) {
-	s.nsRWMutex(nsID).RUnlock()
-	s.endOp()
-}
-
-// beginExclusiveNSOp acquires the store's shared read guard — the same
-// one beginNSOp takes, so this still counts as "an operation in flight"
-// for Close's drain to wait on — plus this namespace's WRITE guard,
-// giving exclusive access to nsID's volume engine without affecting any
-// other namespace at all.
-//
-// This is what lets Compact's phase 2 physically relocate live chunks'
-// bytes safely: it blocks new beginNSOp calls for the SAME namespace (so
-// no Get elsewhere can resolve to a location this rewrite is about to
-// invalidate), while every other namespace's Puts, Gets, and everything
-// else proceeds untouched for the full duration of the rewrite, since
-// they contend on a completely different namespace's RWMutex. Prior to
-// this, exclusivity was store-wide (via the store's own write lock),
-// meaning a segment rewrite on one namespace froze every namespace —
-// that store-wide throughput cost is what this narrows away.
-//
-// It returns *errors.ClosedError if the store is already closed, or
-// *errors.NotFoundError if nsID does not exist. On success the caller
-// MUST call endExclusiveNSOp(nsID) exactly once when done.
-func (s *Store) beginExclusiveNSOp(nsID string) (*volume.Engine, error) {
-	if err := s.beginOp(); err != nil {
-		return nil, err
-	}
-	eng, ok := s.engines[nsID]
-	if !ok {
-		s.endOp()
-		return nil, &bserrors.NotFoundError{NamespaceID: nsID}
-	}
-	s.nsRWMutex(nsID).Lock()
-	return eng, nil
-}
-
-// endExclusiveNSOp releases both guards a successful beginExclusiveNSOp
-// call for nsID acquired.
-func (s *Store) endExclusiveNSOp(nsID string) {
-	s.nsRWMutex(nsID).Unlock()
-	s.endOp()
-}
 
 // ── NamespaceHandle ───────────────────────────────────────────────────────────
 
@@ -666,11 +170,12 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 		return nil, err
 	}
 
-	eng, err := h.store.beginNSOp(h.nsID)
+	st, err := h.store.beginEngineOp(h.nsID)
 	if err != nil {
 		return nil, err
 	}
-	defer h.store.endNSOp(h.nsID)
+	defer h.store.endEngineOp(st)
+	eng := st.eng
 
 	// Content-type detection reads from r before WriteBlob does, and that
 	// read can block on slow caller I/O exactly like WriteBlob's own reads
@@ -700,11 +205,10 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 		return nil, fmt.Errorf("store: write blob: %w", err)
 	}
 
-	mu := h.store.nsMutex(h.nsID)
-	mu.Lock()
-	defer mu.Unlock()
+	st.quota.Lock()
+	defer st.quota.Unlock()
 
-	if err := h.checkQuota(ctx, result.TotalSize); err != nil {
+	if err := h.checkQuota(ctx, st, result.TotalSize); err != nil {
 		return nil, err
 	}
 
@@ -720,7 +224,7 @@ func (h *NamespaceHandle) Put(ctx context.Context, key string, r io.Reader, opts
 	}
 
 	ref := object.RefEntry{
-		NamespaceID: h.nsID,
+		NamespaceID: st.uid,
 		Key:         key,
 		BlobID:      result.BlobID,
 		Metadata:    meta,
@@ -790,7 +294,7 @@ func (h *NamespaceHandle) getChunkReader(ctx context.Context, key string) (*chun
 		return nil, err
 	}
 
-	eng, err := h.store.beginNSOp(h.nsID)
+	st, err := h.store.beginEngineOp(h.nsID)
 	if err != nil {
 		return nil, err
 	}
@@ -801,19 +305,20 @@ func (h *NamespaceHandle) getChunkReader(ctx context.Context, key string) (*chun
 	// Store.Close cannot close this engine out from under an in-flight
 	// read — so it is released here only on the error paths below; on the
 	// success path, chunkReader.Close releases it exactly once instead.
+	eng := st.eng
 	guardTransferred := false
 	defer func() {
 		if !guardTransferred {
-			h.store.endNSOp(h.nsID)
+			h.store.endEngineOp(st)
 		}
 	}()
 
-	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
+	ref, err := h.store.idx.GetRef(ctx, st.uid, key)
 	if err != nil {
 		return nil, err
 	}
 
-	blob, err := h.store.idx.GetBlob(ctx, ref.BlobID)
+	blob, err := h.store.idx.GetBlob(ctx, st.uid, ref.BlobID)
 	if err != nil {
 		return nil, fmt.Errorf("store: get blob manifest: %w", err)
 	}
@@ -825,13 +330,13 @@ func (h *NamespaceHandle) getChunkReader(ctx context.Context, key string) (*chun
 	// streamed Get/GetSeekable needs to resolve before any byte can be
 	// served), that's the difference between one transaction and
 	// hundreds.
-	locations, err := h.store.idx.GetChunks(ctx, blob.ChunkIDs)
+	locations, err := h.store.idx.GetChunks(ctx, st.uid, blob.ChunkIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: get chunk locations: %w", err)
 	}
 
 	guardTransferred = true
-	return newChunkReader(eng, locations, func() { h.store.endNSOp(h.nsID) }), nil
+	return newChunkReader(eng, locations, func() { h.store.endEngineOp(st) }), nil
 }
 
 // Head returns metadata for key without reading any blob data.
@@ -840,18 +345,19 @@ func (h *NamespaceHandle) Head(ctx context.Context, key string) (*object.BlobInf
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return nil, err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(st)
 
-	ref, err := h.store.idx.GetRef(ctx, h.nsID, key)
+	ref, err := h.store.idx.GetRef(ctx, st.uid, key)
 	if err != nil {
 		return nil, err
 	}
 	return &object.BlobInfo{
 		Key:         ref.Key,
-		NamespaceID: ref.NamespaceID,
+		NamespaceID: h.nsID,
 		Metadata:    ref.Metadata,
 	}, nil
 }
@@ -863,17 +369,18 @@ func (h *NamespaceHandle) Update(ctx context.Context, key string, metadata map[s
 	if err := validateKey(key); err != nil {
 		return err
 	}
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(st)
 
 	custom := make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		custom[k] = fmt.Sprint(v)
 	}
 
-	return h.store.idx.CommitUpdateRefMetadata(ctx, h.nsID, key, custom, time.Now())
+	return h.store.idx.CommitUpdateRefMetadata(ctx, st.uid, key, custom, time.Now())
 }
 
 // Rename atomically renames a blob from oldKey to newKey.
@@ -886,12 +393,13 @@ func (h *NamespaceHandle) Rename(ctx context.Context, oldKey, newKey string) err
 	if err := validateKey(newKey); err != nil {
 		return err
 	}
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(st)
 
-	return h.store.idx.CommitRenameRef(ctx, h.nsID, oldKey, newKey)
+	return h.store.idx.CommitRenameRef(ctx, st.uid, oldKey, newKey)
 }
 
 // Delete removes the ref for key, making its blob GC-eligible.
@@ -901,12 +409,13 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(st)
 
-	err := h.store.idx.CommitDelete(ctx, h.nsID, key)
+	err = h.store.idx.CommitDelete(ctx, st.uid, key)
 	if err != nil && index.IsNotFound(err) {
 		return nil // idempotent
 	}
@@ -916,12 +425,13 @@ func (h *NamespaceHandle) Delete(ctx context.Context, key string) error {
 // List returns BlobInfo for blobs in this namespace matching opts.
 // Results are in lexicographic key order.
 func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.BlobInfo, error) {
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return nil, err
 	}
-	defer h.store.endOp()
+	defer h.store.endNSOp(st)
 
-	refs, err := h.store.idx.ListRefs(ctx, h.nsID, opts.KeyPrefix)
+	refs, err := h.store.idx.ListRefs(ctx, st.uid, opts.KeyPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -937,7 +447,7 @@ func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.
 		}
 		out = append(out, object.BlobInfo{
 			Key:         ref.Key,
-			NamespaceID: ref.NamespaceID,
+			NamespaceID: h.nsID,
 			Metadata:    ref.Metadata,
 		})
 		if opts.Limit > 0 && len(out) >= opts.Limit {
@@ -949,24 +459,31 @@ func (h *NamespaceHandle) List(ctx context.Context, opts ListOptions) ([]object.
 
 // Stats returns live resource usage for this namespace.
 func (h *NamespaceHandle) Stats(ctx context.Context) (*object.NamespaceStats, error) {
-	if err := h.store.beginOp(); err != nil {
+	st, err := h.store.beginNSOp(h.nsID)
+	if err != nil {
 		return nil, err
 	}
-	defer h.store.endOp()
-	return h.store.idx.GetStats(ctx, h.nsID)
+	defer h.store.endNSOp(st)
+	stats, err := h.store.idx.GetStats(ctx, st.uid)
+	if err != nil {
+		return nil, err
+	}
+	stats.NamespaceID = h.nsID
+	return stats, nil
 }
 
 // Verify reads and CRC-checks every chunk for every blob in this namespace.
 // Returns the first integrity error encountered, or nil.
 // This is an expensive operation — run it offline or on a schedule.
 func (h *NamespaceHandle) Verify(ctx context.Context) error {
-	eng, err := h.store.beginNSOp(h.nsID)
+	st, err := h.store.beginEngineOp(h.nsID)
 	if err != nil {
 		return err
 	}
-	defer h.store.endNSOp(h.nsID)
+	defer h.store.endEngineOp(st)
+	eng := st.eng
 
-	refs, err := h.store.idx.ListRefs(ctx, h.nsID, "")
+	refs, err := h.store.idx.ListRefs(ctx, st.uid, "")
 	if err != nil {
 		return err
 	}
@@ -976,13 +493,13 @@ func (h *NamespaceHandle) Verify(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		blob, err := h.store.idx.GetBlob(ctx, ref.BlobID)
+		blob, err := h.store.idx.GetBlob(ctx, st.uid, ref.BlobID)
 		if err != nil {
 			return fmt.Errorf("store: verify: missing manifest for blob %s (key %q): %w",
 				ref.BlobID, ref.Key, err)
 		}
 
-		locations, err := h.store.idx.GetChunks(ctx, blob.ChunkIDs)
+		locations, err := h.store.idx.GetChunks(ctx, st.uid, blob.ChunkIDs)
 		if err != nil {
 			return fmt.Errorf("store: verify: missing location for a chunk of blob %s (key %q): %w",
 				ref.BlobID, ref.Key, err)
@@ -1053,11 +570,12 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 		)
 	}
 
-	eng, err := h.store.beginNSOp(h.nsID)
+	st, err := h.store.beginEngineOp(h.nsID)
 	if err != nil {
 		return err
 	}
-	defer h.store.endNSOp(h.nsID)
+	defer h.store.endEngineOp(st)
+	eng := st.eng
 
 	type blobAccum struct {
 		chunkIDs    map[int]object.ChunkID // by Seq, so out-of-order page scans still assemble correctly
@@ -1116,7 +634,7 @@ func (h *NamespaceHandle) RebuildIndex(ctx context.Context) error {
 		for seq, cid := range acc.chunkIDs {
 			orderedChunkIDs[seq] = cid
 		}
-		if err := h.store.idx.PutBlob(ctx, object.BlobEntry{
+		if err := h.store.idx.PutBlob(ctx, st.uid, object.BlobEntry{
 			BlobID:    blobID,
 			ChunkIDs:  orderedChunkIDs,
 			TotalSize: acc.totalSize,
@@ -1217,11 +735,12 @@ func (h *NamespaceHandle) CompactWithOptions(ctx context.Context, opts CompactOp
 // and the chunk become collectable — which is exactly what keeps a chunk
 // shared between blob A and blob B alive after A is deleted.
 func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, error) {
-	eng, err := h.store.beginNSOp(h.nsID)
+	st, err := h.store.beginEngineOp(h.nsID)
 	if err != nil {
 		return CompactResult{}, err
 	}
-	defer h.store.endNSOp(h.nsID)
+	defer h.store.endEngineOp(st)
+	eng := st.eng
 
 	var (
 		deadChunks  []object.ChunkEntry // physical pages to re-verify and, if still dead, reap
@@ -1244,7 +763,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		if c, ok := indexCache[id]; ok {
 			return c
 		}
-		c, err := h.store.idx.GetChunk(ctx, id)
+		c, err := h.store.idx.GetChunk(ctx, st.uid, id)
 		if err != nil {
 			indexCache[id] = nil
 			return nil
@@ -1305,7 +824,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 		if ctx.Err() != nil {
 			return CompactResult{}, ctx.Err()
 		}
-		safeToReap, _, err := h.store.idx.ReapPhysicalPageIfDead(ctx, chunk.ChunkID, chunk.SegmentID, chunk.PageOffset)
+		safeToReap, _, err := h.store.idx.ReapPhysicalPageIfDead(ctx, st.uid, chunk.ChunkID, chunk.SegmentID, chunk.PageOffset)
 		if err != nil {
 			return CompactResult{}, fmt.Errorf("store: confirm dead chunk: %w", err)
 		}
@@ -1322,7 +841,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	// Sweep blob manifests nobody references anymore. Safe regardless of
 	// chunk sharing: chunk records are keyed by content and own their own
 	// refcounts, so removing a dead blob entry never drops live data.
-	blobsRemoved, err := h.store.idx.PurgeDeadBlobs(ctx)
+	blobsRemoved, err := h.store.idx.PurgeDeadBlobs(ctx, st.uid)
 	if err != nil {
 		return CompactResult{}, fmt.Errorf("store: purge dead blobs: %w", err)
 	}
@@ -1349,7 +868,7 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 	// BytesStored, etc. decrements). It also clamps to zero so a
 	// concurrent reap that already handled the same generation cannot
 	// drive DeadBytes/DeadChunks negative.
-	if err := h.store.idx.ReconcileDeadStats(ctx, h.nsID, bytesFreed, chunksFreed); err != nil {
+	if err := h.store.idx.ReconcileDeadStats(ctx, st.uid, bytesFreed, chunksFreed); err != nil {
 		return CompactResult{}, fmt.Errorf("store: compact: reconcile stats: %w", err)
 	}
 
@@ -1364,11 +883,12 @@ func (h *NamespaceHandle) compactPhase1(ctx context.Context) (CompactResult, err
 // meets threshold, reclaiming disk space. See Compact's doc comment for
 // the locking and crash-safety rationale.
 func (h *NamespaceHandle) compactPhase2(ctx context.Context, threshold float64) (bytesFreed int64, segmentsCompacted int64, err error) {
-	eng, err := h.store.beginExclusiveNSOp(h.nsID)
+	st, err := h.store.beginExclusiveEngineOp(h.nsID)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer h.store.endExclusiveNSOp(h.nsID)
+	defer h.store.endExclusiveEngineOp(st)
+	eng := st.eng
 
 	stats, err := eng.SegmentStats()
 	if err != nil {
@@ -1413,7 +933,7 @@ func (h *NamespaceHandle) compactPhase2(ctx context.Context, threshold float64) 
 		// location fields (SegmentID/PageOffset/PageCount) actually
 		// change here.
 		for _, entry := range relocated {
-			existing, err := h.store.idx.GetChunk(ctx, entry.ChunkID)
+			existing, err := h.store.idx.GetChunk(ctx, st.uid, entry.ChunkID)
 			if err != nil {
 				return bytesFreed, segmentsCompacted, fmt.Errorf(
 					"relocate chunk %s to segment %s: look up existing record: %w", entry.ChunkID, rewriteResult.NewSegmentID, err,
@@ -1512,7 +1032,7 @@ func validateKey(key string) error {
 	return nil
 }
 
-func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) error {
+func (h *NamespaceHandle) checkQuota(ctx context.Context, st *nsState, incomingSize int64) error {
 	ns, err := h.store.idx.GetNamespace(ctx, h.nsID)
 	if err != nil {
 		return err
@@ -1521,7 +1041,7 @@ func (h *NamespaceHandle) checkQuota(ctx context.Context, incomingSize int64) er
 		return nil
 	}
 
-	stats, err := h.store.idx.GetStats(ctx, h.nsID)
+	stats, err := h.store.idx.GetStats(ctx, st.uid)
 	if err != nil {
 		return err
 	}

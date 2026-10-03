@@ -23,6 +23,11 @@ func TestDebugSameNS(t *testing.T) {
 	s.CreateNamespace(ctx, object.Namespace{ID: "default"})
 	ns := s.Namespace("default")
 	idx := index.New(backend)
+	nsRec, err := s.GetNamespace(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := nsRec.UID
 
 	rng := rand.New(rand.NewSource(42))
 	base := make([]byte, 16<<20)
@@ -39,7 +44,7 @@ func TestDebugSameNS(t *testing.T) {
 	}
 
 	dumpPages := func(label string) {
-		eng, err := volume.Open(dataDir, "default", volume.Options{})
+		eng, err := volume.Open(dataDir, uid, volume.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -51,13 +56,13 @@ func TestDebugSameNS(t *testing.T) {
 		})
 	}
 
-	blobB, err := idx.GetBlob(ctx, blobIDOf(t, ns, "b"))
+	blobB, err := idx.GetBlob(ctx, uid, blobIDOf(t, ns, "b"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	fmt.Printf("blob b has %d chunks\n", len(blobB.ChunkIDs))
 	for _, cid := range blobB.ChunkIDs {
-		ce, err := idx.GetChunk(ctx, cid)
+		ce, err := idx.GetChunk(ctx, uid, cid)
 		if err != nil {
 			fmt.Printf("  chunk %s: MISSING\n", cid)
 			continue

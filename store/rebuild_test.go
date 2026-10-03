@@ -37,6 +37,17 @@ func segmentDeadPageTotals(t *testing.T, dataDir, nsID string) int {
 	return total
 }
 
+// recUID returns the UID (and therefore the on-disk directory name) of the
+// namespace called name.
+func recUID(t *testing.T, s *store.Store, name string) string {
+	t.Helper()
+	ns, err := s.GetNamespace(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetNamespace(%q): %v", name, err)
+	}
+	return ns.UID
+}
+
 // TestRebuildIndex_SurvivesSubsequentCompact is the core disaster-recovery
 // scenario: the index (bbolt file, or whatever backend) is lost or
 // corrupted entirely, but the segment files on disk are intact.
@@ -61,6 +72,7 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns1 := s1.Namespace("default")
+	uid := recUID(t, s1, "default")
 
 	blobs := map[string]string{
 		"a.txt": "content of blob a",
@@ -79,7 +91,7 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 	// Sanity: before any rebuild, nothing is marked dead. This just
 	// confirms phase 1 wrote successfully; it is not the scenario under
 	// test.
-	if got := segmentDeadPageTotals(t, dataDir, "default"); got != 0 {
+	if got := segmentDeadPageTotals(t, dataDir, uid); got != 0 {
 		t.Fatalf("dead pages = %d before rebuild even started, want 0 (test setup problem)", got)
 	}
 
@@ -93,7 +105,7 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open (phase 2, fresh index): %v", err)
 	}
-	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}, store.WithRecoveredUID(uid)); err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns2 := s2.Namespace("default")
@@ -121,7 +133,7 @@ func TestRebuildIndex_SurvivesSubsequentCompact(t *testing.T) {
 		t.Fatalf("Close (phase 2): %v", err)
 	}
 
-	if got := segmentDeadPageTotals(t, dataDir, "default"); got != 0 {
+	if got := segmentDeadPageTotals(t, dataDir, uid); got != 0 {
 		t.Fatalf("dead pages = %d after RebuildIndex+Compact, want 0 — Compact reaped data RebuildIndex had just recovered", got)
 	}
 }
@@ -146,6 +158,7 @@ func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns1 := s1.Namespace("default")
+	uid := recUID(t, s1, "default")
 
 	if _, err := ns1.Put(ctx, "keep", bytes.NewReader([]byte("survives")), store.PutOptions{}); err != nil {
 		t.Fatalf("Put(keep): %v", err)
@@ -164,7 +177,7 @@ func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	deadBefore := segmentDeadPageTotals(t, dataDir, "default")
+	deadBefore := segmentDeadPageTotals(t, dataDir, uid)
 	if deadBefore == 0 {
 		t.Fatal("expected at least one dead page after deleting+compacting \"remove\" (test setup problem)")
 	}
@@ -176,7 +189,7 @@ func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open (fresh index): %v", err)
 	}
-	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}, store.WithRecoveredUID(uid)); err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns2 := s2.Namespace("default")
@@ -190,7 +203,7 @@ func TestRebuildIndex_DoesNotDisturbAlreadyDeletedPages(t *testing.T) {
 
 	// RebuildIndex only writes index records; it never touches segment
 	// bytes. The dead-page count must be bit-for-bit identical to before.
-	deadAfter := segmentDeadPageTotals(t, dataDir, "default")
+	deadAfter := segmentDeadPageTotals(t, dataDir, uid)
 	if deadAfter != deadBefore {
 		t.Fatalf("dead pages = %d after RebuildIndex, want unchanged from %d — RebuildIndex must not alter segment data", deadAfter, deadBefore)
 	}

@@ -2,22 +2,36 @@
 // serialisation of index records. The backend is deliberately minimal —
 // it speaks only in raw bytes. All structure lives here, not in the backend.
 //
-// Key schema (shown as strings; stored as []byte):
+// Key schema, format 2 (shown as strings; stored as []byte).
 //
-//	ns:<nsID>                        → Namespace
-//	ref:<nsID>:<key>                 → RefEntry
-//	blob:<blobID>                    → BlobEntry
-//	chunk:<chunkID>                  → ChunkEntry
-//	seg:<nsID>:<segID16hex>          → SegmentEntry
-//	stats:<nsID>                     → NamespaceStats
+// <name> is a namespace's human-chosen name. <uid> is the immutable,
+// never-reused identity of one namespace incarnation (see object.Namespace.UID).
+// Everything a namespace owns is keyed by <uid>, so a namespace that is deleted
+// and re-created under the same name shares no index state with its
+// predecessor, and one namespace's records can never be reached through
+// another's keys.
+//
+//	meta:format                      → "2"
+//	ns:<name>                        → Namespace (carries the UID)
+//	del:<uid>                        → DeletedNamespace tombstone
+//	ref:<uid>:<key>                  → RefEntry
+//	blb:<uid>:<blobID>               → BlobEntry
+//	chk:<uid>:<chunkID>              → ChunkEntry
+//	seg:<uid>:<segID16hex>           → SegmentEntry
+//	stats:<uid>                      → NamespaceStats
+//
+// Format 1 (store v1.3.x and earlier) keyed refs/segments/stats by name and kept
+// blob manifests and chunk records in two global key spaces, "blob:<blobID>"
+// and "chunk:<chunkID>". Those are read only by the one-time upgrade (see
+// legacy.go) and then deleted.
 package index
 
 import (
-	"maps"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -64,13 +78,21 @@ type BatchGetter interface {
 
 // ── Key constructors ──────────────────────────────────────────────────────────
 
-func keyNS(nsID string) []byte          { return []byte("ns:" + nsID) }
-func prefixNS() []byte                  { return []byte("ns:") }
-func keyRef(nsID, key string) []byte    { return []byte("ref:" + nsID + ":" + key) }
-func prefixRef(nsID string) []byte      { return []byte("ref:" + nsID + ":") }
-func keyBlob(id object.BlobID) []byte   { return []byte("blob:" + string(id)) }
-func prefixBlob() []byte                { return []byte("blob:") }
-func keyChunk(id object.ChunkID) []byte { return []byte("chunk:" + string(id)) }
+func keyNS(name string) []byte       { return []byte("ns:" + name) }
+func prefixNS() []byte               { return []byte("ns:") }
+func keyTombstone(uid string) []byte { return []byte("del:" + uid) }
+func prefixTombstone() []byte        { return []byte("del:") }
+func keyFormat() []byte              { return []byte("meta:format") }
+func keyRef(nsID, key string) []byte { return []byte("ref:" + nsID + ":" + key) }
+func prefixRef(nsID string) []byte   { return []byte("ref:" + nsID + ":") }
+func keyBlob(owner string, id object.BlobID) []byte {
+	return []byte("blb:" + owner + ":" + string(id))
+}
+func prefixBlob(owner string) []byte { return []byte("blb:" + owner + ":") }
+func keyChunk(owner string, id object.ChunkID) []byte {
+	return []byte("chk:" + owner + ":" + string(id))
+}
+func prefixChunk(owner string) []byte { return []byte("chk:" + owner + ":") }
 func keySeg(nsID string, id object.SegmentID) []byte {
 	return fmt.Appendf(nil, "seg:%s:%s", nsID, id.String())
 }
@@ -190,16 +212,19 @@ func (idx *Index) ListRefs(ctx context.Context, nsID, keyPrefix string) ([]objec
 
 // ── Blobs ─────────────────────────────────────────────────────────────────────
 
-func (idx *Index) PutBlob(ctx context.Context, blob object.BlobEntry) error {
+// PutBlob stores blob's manifest under owner, the owning namespace's UID.
+func (idx *Index) PutBlob(ctx context.Context, owner string, blob object.BlobEntry) error {
 	v, err := marshal(blob)
 	if err != nil {
 		return err
 	}
-	return idx.b.Put(ctx, keyBlob(blob.BlobID), v)
+	return idx.b.Put(ctx, keyBlob(owner, blob.BlobID), v)
 }
 
-func (idx *Index) GetBlob(ctx context.Context, id object.BlobID) (*object.BlobEntry, error) {
-	v, err := idx.b.Get(ctx, keyBlob(id))
+// GetBlob returns the manifest owner holds for id. A manifest belonging to any
+// other namespace is invisible here.
+func (idx *Index) GetBlob(ctx context.Context, owner string, id object.BlobID) (*object.BlobEntry, error) {
+	v, err := idx.b.Get(ctx, keyBlob(owner, id))
 	if err != nil {
 		return nil, err
 	}
@@ -207,11 +232,11 @@ func (idx *Index) GetBlob(ctx context.Context, id object.BlobID) (*object.BlobEn
 	return &blob, unmarshal(v, &blob)
 }
 
-func (idx *Index) DeleteBlob(ctx context.Context, id object.BlobID) error {
-	return idx.b.Delete(ctx, keyBlob(id))
+func (idx *Index) DeleteBlob(ctx context.Context, owner string, id object.BlobID) error {
+	return idx.b.Delete(ctx, keyBlob(owner, id))
 }
 
-// PurgeDeadBlobs removes every blob manifest whose RefCount has reached
+// PurgeDeadBlobs removes every blob manifest owned by owner whose RefCount has reached
 // zero. Blob records are keyed by content and hold no owned data — chunk
 // records are independent and carry their own refcounts — so removing a
 // dead manifest is always safe and never drops live bytes, PROVIDED the
@@ -228,9 +253,9 @@ func (idx *Index) DeleteBlob(ctx context.Context, id object.BlobID) error {
 // Put/Compact load before this fix. Each candidate is therefore
 // re-checked and deleted atomically, in its own transaction, so the
 // decision can never go stale between check and delete.
-func (idx *Index) PurgeDeadBlobs(ctx context.Context) (int, error) {
+func (idx *Index) PurgeDeadBlobs(ctx context.Context, owner string) (int, error) {
 	var candidates []object.BlobID
-	err := idx.b.Scan(ctx, prefixBlob(), func(k, v []byte) error {
+	err := idx.b.Scan(ctx, prefixBlob(owner), func(k, v []byte) error {
 		var blob object.BlobEntry
 		if err := unmarshal(v, &blob); err != nil {
 			return err
@@ -246,7 +271,7 @@ func (idx *Index) PurgeDeadBlobs(ctx context.Context) (int, error) {
 
 	var removed int
 	for _, id := range candidates {
-		key := keyBlob(id)
+		key := keyBlob(owner, id)
 		var didRemove bool
 		err := idx.b.Tx(ctx, func(tx Tx) error {
 			raw, err := tx.Get(key)
@@ -281,16 +306,20 @@ func (idx *Index) PurgeDeadBlobs(ctx context.Context) (int, error) {
 
 // ── Chunks ────────────────────────────────────────────────────────────────────
 
+// PutChunk stores chunk under its own NamespaceID, which must be the owning
+// namespace's UID.
 func (idx *Index) PutChunk(ctx context.Context, chunk object.ChunkEntry) error {
 	v, err := marshal(chunk)
 	if err != nil {
 		return err
 	}
-	return idx.b.Put(ctx, keyChunk(chunk.ChunkID), v)
+	return idx.b.Put(ctx, keyChunk(chunk.NamespaceID, chunk.ChunkID), v)
 }
 
-func (idx *Index) GetChunk(ctx context.Context, id object.ChunkID) (*object.ChunkEntry, error) {
-	v, err := idx.b.Get(ctx, keyChunk(id))
+// GetChunk returns owner's record for chunk id. A chunk record belonging to any
+// other namespace is invisible here.
+func (idx *Index) GetChunk(ctx context.Context, owner string, id object.ChunkID) (*object.ChunkEntry, error) {
+	v, err := idx.b.Get(ctx, keyChunk(owner, id))
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +339,7 @@ func (idx *Index) GetChunk(ctx context.Context, id object.ChunkID) (*object.Chun
 //
 // Returns *errors.NotFoundError, identifying the specific missing chunk
 // ID in its error message, if any id in ids has no index entry.
-func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object.ChunkEntry, error) {
+func (idx *Index) GetChunks(ctx context.Context, owner string, ids []object.ChunkID) ([]object.ChunkEntry, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -319,7 +348,7 @@ func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object
 	if !ok {
 		chunks := make([]object.ChunkEntry, len(ids))
 		for i, id := range ids {
-			chunk, err := idx.GetChunk(ctx, id)
+			chunk, err := idx.GetChunk(ctx, owner, id)
 			if err != nil {
 				return nil, err
 			}
@@ -330,7 +359,7 @@ func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object
 
 	keys := make([][]byte, len(ids))
 	for i, id := range ids {
-		keys[i] = keyChunk(id)
+		keys[i] = keyChunk(owner, id)
 	}
 	raws, err := bg.GetMulti(ctx, keys)
 	if err != nil {
@@ -348,8 +377,8 @@ func (idx *Index) GetChunks(ctx context.Context, ids []object.ChunkID) ([]object
 	return chunks, nil
 }
 
-func (idx *Index) DeleteChunk(ctx context.Context, id object.ChunkID) error {
-	return idx.b.Delete(ctx, keyChunk(id))
+func (idx *Index) DeleteChunk(ctx context.Context, owner string, id object.ChunkID) error {
+	return idx.b.Delete(ctx, keyChunk(owner, id))
 }
 
 // ReapPhysicalPageIfDead atomically decides whether a specific scanned
@@ -389,9 +418,9 @@ func (idx *Index) DeleteChunk(ctx context.Context, id object.ChunkID) error {
 // track a "dead chunk records" count use this instead of safeToReap so
 // stale phantom pages (reaped but never owning the index record) aren't
 // double-counted against it.
-func (idx *Index) ReapPhysicalPageIfDead(ctx context.Context, id object.ChunkID, segID object.SegmentID, pageOffset int64) (safeToReap bool, recordDeleted bool, err error) {
+func (idx *Index) ReapPhysicalPageIfDead(ctx context.Context, owner string, id object.ChunkID, segID object.SegmentID, pageOffset int64) (safeToReap bool, recordDeleted bool, err error) {
 	err = idx.b.Tx(ctx, func(tx Tx) error {
-		raw, err := tx.Get(keyChunk(id))
+		raw, err := tx.Get(keyChunk(owner, id))
 		if err != nil {
 			if IsNotFound(err) {
 				// No record at all for this ChunkID right now. Whatever
@@ -424,7 +453,7 @@ func (idx *Index) ReapPhysicalPageIfDead(ctx context.Context, id object.ChunkID,
 			safeToReap = false
 			return nil
 		}
-		if err := tx.Delete(keyChunk(id)); err != nil {
+		if err := tx.Delete(keyChunk(owner, id)); err != nil {
 			return err
 		}
 		safeToReap = true
@@ -560,6 +589,10 @@ func (idx *Index) CommitPut(
 	blob object.BlobEntry,
 	chunks []object.ChunkEntry,
 ) (reused []object.ChunkEntry, err error) {
+	// owner is the namespace UID. Refs, blob manifests and chunk records are
+	// all keyed by it, so this transaction can neither see nor modify any other
+	// namespace's records.
+	owner := ref.NamespaceID
 	err = idx.b.Tx(ctx, func(tx Tx) error {
 		// 1. Check for existing ref (overwrite detection).
 		var oldBlobID object.BlobID
@@ -594,7 +627,7 @@ func (idx *Index) CommitPut(
 		// 3. Upsert the blob entry.
 		//    If this blobID already exists (dedup hit), just increment RefCount.
 		//    Otherwise write a fresh entry with RefCount=1.
-		existingBlobRaw, err := tx.Get(keyBlob(blob.BlobID))
+		existingBlobRaw, err := tx.Get(keyBlob(owner, blob.BlobID))
 		if err != nil && !IsNotFound(err) {
 			return err
 		}
@@ -609,7 +642,7 @@ func (idx *Index) CommitPut(
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyBlob(blob.BlobID), v); err != nil {
+			if err := tx.Put(keyBlob(owner, blob.BlobID), v); err != nil {
 				return err
 			}
 		} else {
@@ -619,7 +652,7 @@ func (idx *Index) CommitPut(
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyBlob(blob.BlobID), v); err != nil {
+			if err := tx.Put(keyBlob(owner, blob.BlobID), v); err != nil {
 				return err
 			}
 		}
@@ -628,7 +661,7 @@ func (idx *Index) CommitPut(
 		//    overwrite replaced it with different content.
 		var deadBytes, deadChunks int64
 		if isOverwrite && !sameContent {
-			raw, err := tx.Get(keyBlob(oldBlobID))
+			raw, err := tx.Get(keyBlob(owner, oldBlobID))
 			if err != nil && !IsNotFound(err) {
 				return err
 			}
@@ -642,13 +675,13 @@ func (idx *Index) CommitPut(
 				if err != nil {
 					return err
 				}
-				if err := tx.Put(keyBlob(oldBlobID), v); err != nil {
+				if err := tx.Put(keyBlob(owner, oldBlobID), v); err != nil {
 					return err
 				}
 
 				// Old chunks lose one reference; those reaching zero are dead.
 				for _, cid := range oldBlob.ChunkIDs {
-					deadLen, err := decrementChunkRefTx(tx, cid)
+					deadLen, err := decrementChunkRefTx(tx, owner, cid)
 					if err != nil {
 						return err
 					}
@@ -661,17 +694,19 @@ func (idx *Index) CommitPut(
 		}
 
 		// 5. Upsert chunk entries with refcount-aware dedup. Chunks whose
-		//    content hash is already indexed are reused: we keep the existing
-		//    location, bump its RefCount, and report the freshly written
-		//    duplicate back to the caller for reaping.
+		//    content hash is already indexed *in this namespace* are reused:
+		//    we keep the existing location, bump its RefCount, and report
+		//    the freshly written duplicate back to the caller for reaping.
 		//
-		//    Reuse is limited to chunks already indexed in THIS namespace:
-		//    a chunk's location is a (segment, page) inside its namespace's
-		//    own segment files, and a reader can only open its own
-		//    namespace's engine. Pointing a blob at a foreign namespace's
-		//    location would make reads fail, so an existing record owned by
-		//    another namespace is treated as absent — we register our own
-		//    copy instead (the pre-dedup behavior).
+		//    Chunk records are keyed by (owner, chunkID), so "already
+		//    indexed" can only ever mean "already indexed by this
+		//    namespace". Identical bytes stored by another namespace live
+		//    under that namespace's own key, in that namespace's own segment
+		//    files, and are neither visible to nor modified by this
+		//    transaction. (Before records were owner-scoped, a chunk with
+		//    the same hash in another namespace was overwritten here,
+		//    pointing the first namespace's blobs at the second namespace's
+		//    segment locations.)
 		//
 		//    A dedup-hit can land on a chunk record that is *currently
 		//    dead* (RefCount == 0, but not yet reaped by Compact — dying
@@ -690,29 +725,27 @@ func (idx *Index) CommitPut(
 		var revivedBytes, revivedChunks int64
 		var newPhysicalBytes int64
 		for _, chunk := range chunks {
-			existingRaw, err := tx.Get(keyChunk(chunk.ChunkID))
+			chunk.NamespaceID = owner
+			existingRaw, err := tx.Get(keyChunk(owner, chunk.ChunkID))
 			if err == nil {
 				var existing object.ChunkEntry
 				if err := unmarshal(existingRaw, &existing); err != nil {
 					return err
 				}
-				if existing.NamespaceID == ref.NamespaceID {
-					if existing.RefCount == 0 {
-						revivedBytes += existing.Length
-						revivedChunks++
-					}
-					existing.RefCount++
-					v, err := marshal(existing)
-					if err != nil {
-						return err
-					}
-					if err := tx.Put(keyChunk(chunk.ChunkID), v); err != nil {
-						return err
-					}
-					reused = append(reused, chunk)
-					continue
+				if existing.RefCount == 0 {
+					revivedBytes += existing.Length
+					revivedChunks++
 				}
-				// Fall through: foreign namespace's record — keep our copy.
+				existing.RefCount++
+				v, err := marshal(existing)
+				if err != nil {
+					return err
+				}
+				if err := tx.Put(keyChunk(owner, chunk.ChunkID), v); err != nil {
+					return err
+				}
+				reused = append(reused, chunk)
+				continue
 			} else if !IsNotFound(err) {
 				return err
 			}
@@ -721,7 +754,7 @@ func (idx *Index) CommitPut(
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyChunk(chunk.ChunkID), v); err != nil {
+			if err := tx.Put(keyChunk(owner, chunk.ChunkID), v); err != nil {
 				return err
 			}
 			newPhysicalBytes += chunk.Length
@@ -759,8 +792,8 @@ func (idx *Index) CommitPut(
 // Compact's phase 1 sweep reaps it. Requires a live transaction. Returns
 // the chunk's payload length when the reference count drops to zero
 // (report it as newly dead bytes), and 0 otherwise.
-func decrementChunkRefTx(tx Tx, cid object.ChunkID) (int64, error) {
-	raw, err := tx.Get(keyChunk(cid))
+func decrementChunkRefTx(tx Tx, owner string, cid object.ChunkID) (int64, error) {
+	raw, err := tx.Get(keyChunk(owner, cid))
 	if err != nil && !IsNotFound(err) {
 		return 0, err
 	}
@@ -782,7 +815,7 @@ func decrementChunkRefTx(tx Tx, cid object.ChunkID) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return deadLen, tx.Put(keyChunk(cid), v)
+	return deadLen, tx.Put(keyChunk(owner, cid), v)
 }
 
 // CommitDelete atomically removes a ref and decrements the blob's RefCount.
@@ -806,7 +839,7 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 
 		// Decrement blob RefCount.
 		var blob *object.BlobEntry
-		blobRaw, err := tx.Get(keyBlob(ref.BlobID))
+		blobRaw, err := tx.Get(keyBlob(nsID, ref.BlobID))
 		if err != nil && !IsNotFound(err) {
 			return err
 		}
@@ -820,7 +853,7 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyBlob(ref.BlobID), v); err != nil {
+			if err := tx.Put(keyBlob(nsID, ref.BlobID), v); err != nil {
 				return err
 			}
 			blob = &b
@@ -837,7 +870,7 @@ func (idx *Index) CommitDelete(ctx context.Context, nsID, key string) error {
 		if blob != nil {
 			// Decrement each chunk's RefCount; those hitting zero are dead.
 			for _, cid := range blob.ChunkIDs {
-				deadLen, err := decrementChunkRefTx(tx, cid)
+				deadLen, err := decrementChunkRefTx(tx, nsID, cid)
 				if err != nil {
 					return err
 				}

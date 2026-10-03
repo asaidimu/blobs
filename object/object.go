@@ -97,8 +97,12 @@ type Metadata struct {
 
 // ── Index record types ────────────────────────────────────────────────────────
 
-// RefEntry is the index record for a (namespaceID, key) → BlobID mapping.
+// RefEntry is the index record for a (namespace, key) → BlobID mapping.
 // It is the only mutable layer — the blob it points at is immutable.
+//
+// NamespaceID is the owning namespace's UID (see Namespace.UID), not its
+// human-chosen name. The store translates back to the name in everything it
+// returns to callers (see BlobInfo).
 type RefEntry struct {
 	NamespaceID string   `json:"namespace_id"`
 	Key         string   `json:"key"`
@@ -106,9 +110,15 @@ type RefEntry struct {
 	Metadata    Metadata `json:"metadata"`
 }
 
-// BlobEntry is the index record for a content-addressed blob.
-// Shared across all namespaces that reference the same content.
-// RefCount tracks how many RefEntries point here; zero means GC-eligible.
+// BlobEntry is the index record for a content-addressed blob manifest.
+//
+// Manifests are owned by one namespace (by UID) and are never shared across
+// namespaces: two namespaces that store identical bytes each have their own
+// manifest, chunk records and physical copy. Deduplication happens within a
+// namespace only, which is what keeps tenants isolated.
+//
+// RefCount tracks how many RefEntries in the owning namespace point here;
+// zero means GC-eligible.
 type BlobEntry struct {
 	BlobID    BlobID    `json:"blob_id"`
 	ChunkIDs  []ChunkID `json:"chunk_ids"` // ordered; reassemble in this order
@@ -118,6 +128,8 @@ type BlobEntry struct {
 }
 
 // ChunkEntry is the index record for a chunk's physical location on disk.
+// NamespaceID is the owning namespace's UID; a chunk record is only ever
+// visible to, and resolvable by, that namespace.
 type ChunkEntry struct {
 	ChunkID     ChunkID   `json:"chunk_id"`
 	BlobID      BlobID    `json:"blob_id"`
@@ -170,7 +182,21 @@ type SegmentEntry struct {
 
 // Namespace is an isolated logical partition within a Store.
 type Namespace struct {
-	ID          string            `json:"id"`
+	// ID is the human-chosen name callers use to address the namespace.
+	ID string `json:"id"`
+
+	// UID identifies this namespace *incarnation*. It is assigned by the
+	// store when the namespace is created, is immutable, and is never
+	// reused: deleting a namespace and creating another with the same ID
+	// yields a different UID. Everything the namespace owns — its index
+	// records and its directory under Config.DataDir — is keyed by UID, never
+	// by ID, so a re-created name shares no state with its predecessor.
+	//
+	// Any value supplied by the caller to CreateNamespace is ignored.
+	// Namespaces created before UIDs existed have UID == ID (their directory
+	// did not move when the store was upgraded).
+	UID string `json:"uid,omitempty"`
+
 	DisplayName string            `json:"display_name,omitempty"`
 	CreatedAt   time.Time         `json:"created_at"`
 	Quota       *Quota            `json:"quota,omitempty"` // nil = unlimited
@@ -230,6 +256,16 @@ type NamespaceStats struct {
 	DeadChunks    int64     `json:"dead_chunks"`    // unreferenced chunks awaiting compaction
 	SegmentCount  int64     `json:"segment_count"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// DeletedNamespace is the tombstone left by Store.DeleteNamespace. The name
+// is released the moment the tombstone is written; the namespace's data
+// (identified by UID) is erased afterwards and the tombstone removed. A
+// surviving tombstone means that erase has not finished yet.
+type DeletedNamespace struct {
+	UID       string    `json:"uid"`
+	Name      string    `json:"name"`
+	DeletedAt time.Time `json:"deleted_at"`
 }
 
 // StoreStats aggregates metrics across all namespaces.

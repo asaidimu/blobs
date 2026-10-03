@@ -58,7 +58,7 @@ func TestWALReplay_RegistersInterruptedWriteAsNonReapable(t *testing.T) {
 	}
 	defer s.Close()
 	ctx := context.Background()
-	if err := s.CreateNamespace(ctx, object.Namespace{ID: nsID}); err != nil {
+	if err := s.CreateNamespace(ctx, object.Namespace{ID: nsID}, store.WithRecoveredUID(nsID)); err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns := s.Namespace(nsID)
@@ -106,6 +106,7 @@ func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns1 := s1.Namespace("default")
+	uid := recUID(t, s1, "default")
 
 	if _, err := ns1.Put(ctx, "normal", bytes.NewReader([]byte("a completely normal, fully committed write")), store.PutOptions{}); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -129,7 +130,7 @@ func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 		t.Fatalf("store.Open (fresh index): %v", err)
 	}
 	defer s2.Close()
-	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}); err != nil {
+	if err := s2.CreateNamespace(ctx, object.Namespace{ID: "default"}, store.WithRecoveredUID(uid)); err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	ns2 := s2.Namespace("default")
@@ -150,7 +151,7 @@ func TestWALReplay_SkipsAlreadyCommittedBlobs(t *testing.T) {
 	// replay's RefCount:1 registration applies identically whether the
 	// original Put fully completed or was interrupted, since (with a
 	// fresh index either way) neither case has any RefEntry.
-	if got := segmentDeadPageTotals(t, dataDir, "default"); got != 0 {
+	if got := segmentDeadPageTotals(t, dataDir, uid); got != 0 {
 		t.Fatalf("dead pages = %d, want 0", got)
 	}
 }
