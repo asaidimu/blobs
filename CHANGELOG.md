@@ -1,3 +1,10 @@
+## [1.3.5](https://github.com/asaidimu/blobs/compare/v1.3.4...v1.3.5) (2026-11-06)
+
+
+### Bug Fixes
+
+* **store,index:** isolate namespaces by UID, erase on delete, upgrade legacy index ([1a5ad83](https://github.com/asaidimu/blobs/commit/1a5ad8388130870f4013304fa3f47f883aeef994))
+
 ## [1.3.4](https://github.com/asaidimu/blobs/compare/v1.3.3...v1.3.4) (2026-09-10)
 
 
