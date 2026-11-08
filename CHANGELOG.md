@@ -1,3 +1,10 @@
+## [1.3.6](https://github.com/asaidimu/blobs/compare/v1.3.5...v1.3.6) (2026-11-08)
+
+
+### Bug Fixes
+
+* update dependencies ([2a313de](https://github.com/asaidimu/blobs/commit/2a313ded766fe39f56379a03411821f7c52f11a7))
+
 ## [1.3.5](https://github.com/asaidimu/blobs/compare/v1.3.4...v1.3.5) (2026-11-06)
 
 
